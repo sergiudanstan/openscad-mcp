@@ -1,4 +1,4 @@
-"""Library tools: listing files, cheatsheet, version, syntax check, examples."""
+"""Library tools: listing files, cheatsheet, version, syntax check, examples, library management."""
 
 import json
 from pathlib import Path
@@ -7,6 +7,36 @@ from mcp.server.fastmcp import FastMCP, Context
 
 # Examples directory: openscad-mcp/examples/ (two package levels + src + project root)
 _EXAMPLES_DIR = Path(__file__).resolve().parent.parent.parent.parent / "examples"
+
+# Library descriptions for all 25 official OpenSCAD libraries + MCAD
+_LIBRARY_INFO = {
+    "MCAD": "Built-in library with gears, motors, shapes, materials, math, and more",
+    "BOSL2": "Belfry OpenScad Library v2: advanced shapes, rounding, beziers, attachments, distributors",
+    "BOSL": "Original Belfry OpenScad Library: tools, shapes, and helpers",
+    "dotSCAD": "Math-driven 3D modeling: Voronoi, path extrusion, maze, polyhedra, turtle graphics",
+    "NopSCADlib": "Vitamins library: screws, nuts, PCBs, motors, bearings, electronics, 3D printer parts",
+    "UB.scad": "3D printing workflow: object tools, view helpers, mechanical parts",
+    "FunctionalOpenSCAD": "Meta-programming: implementing OpenSCAD in OpenSCAD",
+    "constructive": "Stamping approach for complex mechanical parts assembly",
+    "StoneAgeLib": "Collection of 3D printing model scripts and utilities",
+    "BOLTS": "Open Library of Technical Specifications: standard fasteners and hardware",
+    "OpenSCAD-Snippet": "Asset collection: mechanical parts, furniture, animation base meshes",
+    "BoardGameToolkit": "Board game boxes with tessellation layouts and custom shapes",
+    "Round-Anything": "Robust rounding utilities using polyRound approach",
+    "MarksEnclosureHelper": "Hinged boxes with rounded corners and various closures",
+    "funcutils": "Functional programming techniques for OpenSCAD",
+    "threads-scad": "Efficient threading: metric internal/external threads, nuts, bolts",
+    "smooth-prim": "Smooth primitives with specified rounded edges",
+    "plot-function": "Render math functions in Cartesian, polar, and axial coordinates",
+    "closepoints": "Create shapes from point lists using polyhedron transformations",
+    "openscad-tray": "Parametric trays with optional subdivisions for storage",
+    "YAPP_Box": "Yet Another Parametric Projectbox generator for electronics",
+    "STEMFIE": "Educational construction-set parts (STEMFIE project)",
+    "catchnhole": "Ergonomic nutcatches, screw holes, and countersinks",
+    "pathbuilder": "Complex 2D shapes with fillets/chamfers using SVG-like syntax",
+    "SCON": "JSON-like configuration data format for OpenSCAD",
+    "A2D": "Altair 2D library: functions, modules, constants for 2D drawing",
+}
 
 _CHEATSHEET = """\
 OpenSCAD Quick Reference (v2021.01)
@@ -206,6 +236,102 @@ def register_library_tools(mcp: FastMCP) -> None:
                 "examples": examples,
                 "count": len(examples),
                 "directory": str(_EXAMPLES_DIR),
+            })
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+    @mcp.tool()
+    async def openscad_list_libraries(ctx: Context) -> str:
+        """List all installed OpenSCAD libraries with descriptions and usage examples.
+
+        Libraries are auto-loaded via OPENSCADPATH. Use them with:
+          use <LibraryName/module.scad>
+          include <LibraryName/module.scad>
+        """
+        try:
+            client = ctx.request_context.lifespan_context["client"]
+            libs = []
+            for lib_dir in sorted(client.libraries.iterdir()):
+                if lib_dir.is_dir() and not lib_dir.name.startswith("."):
+                    name = lib_dir.name
+                    # Count .scad files
+                    scad_files = list(lib_dir.rglob("*.scad"))
+                    # Find main entry point
+                    main_files = [f for f in scad_files if f.stem.lower() in (
+                        name.lower(), "main", "std", "core", "lib", "all"
+                    )]
+                    entry = main_files[0].relative_to(lib_dir) if main_files else None
+                    libs.append({
+                        "name": name,
+                        "description": _LIBRARY_INFO.get(name, "Community library"),
+                        "scad_files": len(scad_files),
+                        "entry_point": str(entry) if entry else None,
+                        "use_example": f'use <{name}/{entry}>' if entry else f'use <{name}/...>',
+                        "path": str(lib_dir),
+                    })
+
+            # Also check for MCAD in app bundle
+            mcad_path = Path("/Applications/OpenSCAD-2021.01.app/Contents/Resources/libraries/MCAD")
+            if mcad_path.is_dir():
+                scad_files = list(mcad_path.rglob("*.scad"))
+                libs.insert(0, {
+                    "name": "MCAD",
+                    "description": _LIBRARY_INFO.get("MCAD", "Built-in library"),
+                    "scad_files": len(scad_files),
+                    "entry_point": None,
+                    "use_example": 'use <MCAD/gears.scad>',
+                    "path": str(mcad_path),
+                })
+
+            return json.dumps({
+                "libraries": libs,
+                "count": len(libs),
+                "library_path": str(client.libraries),
+            })
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+    @mcp.tool()
+    async def openscad_library_info(ctx: Context, library_name: str) -> str:
+        """Get detailed info about a specific library: files, modules, usage.
+
+        Args:
+            library_name: Name of the library (e.g. "BOSL2", "NopSCADlib", "SCON").
+        """
+        try:
+            client = ctx.request_context.lifespan_context["client"]
+            lib_dir = client.libraries / library_name
+            if not lib_dir.is_dir():
+                return json.dumps({"error": f"Library not found: {library_name}"})
+
+            # Collect all .scad files organized by subdirectory
+            scad_files = sorted(lib_dir.rglob("*.scad"))
+            file_tree = {}
+            for f in scad_files:
+                rel = f.relative_to(lib_dir)
+                parent = str(rel.parent) if str(rel.parent) != "." else "/"
+                if parent not in file_tree:
+                    file_tree[parent] = []
+                file_tree[parent].append(rel.name)
+
+            # Read README if available
+            readme = None
+            for readme_name in ("README.md", "readme.md", "README.txt", "README"):
+                readme_path = lib_dir / readme_name
+                if readme_path.exists():
+                    content = readme_path.read_text(encoding="utf-8", errors="replace")
+                    # Truncate to first 2000 chars
+                    readme = content[:2000] + ("..." if len(content) > 2000 else "")
+                    break
+
+            return json.dumps({
+                "name": library_name,
+                "description": _LIBRARY_INFO.get(library_name, "Community library"),
+                "path": str(lib_dir),
+                "total_scad_files": len(scad_files),
+                "file_tree": file_tree,
+                "readme_excerpt": readme,
+                "usage": f'use <{library_name}/filename.scad>',
             })
         except Exception as e:
             return json.dumps({"error": str(e)})

@@ -9,6 +9,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 DEFAULT_WORKSPACE = Path.home() / "openscad-mcp-workspace"
+DEFAULT_LIBRARIES = Path.home() / "Documents" / "OpenSCAD" / "libraries"
 RENDER_TIMEOUT = 60  # seconds
 
 
@@ -17,6 +18,7 @@ class OpenSCADClient:
 
     def __init__(self, workspace: Path | None = None) -> None:
         self.workspace = workspace or DEFAULT_WORKSPACE
+        self.libraries = DEFAULT_LIBRARIES
         self.binary: str | None = None
 
     # ------------------------------------------------------------------
@@ -45,6 +47,34 @@ class OpenSCADClient:
         if self.binary is None:
             self.binary = self.discover_binary()
         self.workspace.mkdir(parents=True, exist_ok=True)
+        self.libraries.mkdir(parents=True, exist_ok=True)
+        # Symlink each library into workspace so use<Lib/file.scad> works
+        self._sync_library_symlinks()
+
+    def _sync_library_symlinks(self) -> None:
+        """Create symlinks in workspace for each installed library."""
+        if not self.libraries.is_dir():
+            return
+        for lib_dir in self.libraries.iterdir():
+            if lib_dir.is_dir() and not lib_dir.name.startswith("."):
+                link = self.workspace / lib_dir.name
+                if not link.exists():
+                    try:
+                        link.symlink_to(lib_dir)
+                        logger.info("Symlinked library: %s", lib_dir.name)
+                    except OSError:
+                        logger.debug("Could not symlink %s", lib_dir.name)
+
+    def library_paths(self) -> list[str]:
+        """Return --library flags for all installed library directories."""
+        paths = []
+        if self.libraries.is_dir():
+            paths.append(str(self.libraries))
+        # Also add MCAD from the app bundle if present
+        mcad_path = Path("/Applications/OpenSCAD-2021.01.app/Contents/Resources/libraries")
+        if mcad_path.is_dir() and str(mcad_path) not in paths:
+            paths.append(str(mcad_path))
+        return paths
 
     # ------------------------------------------------------------------
     # Core runner
@@ -57,16 +87,26 @@ class OpenSCADClient:
     ) -> tuple[int, str, str]:
         """Run openscad with the given arguments.
 
+        Automatically sets OPENSCADPATH so all installed libraries are found.
         Returns (returncode, stdout, stderr).
         """
         cmd = [self.binary, *args]
         logger.debug("Running: %s", " ".join(cmd))
+
+        # Build environment with OPENSCADPATH pointing to all library dirs
+        env = os.environ.copy()
+        lib_paths = self.library_paths()
+        if lib_paths:
+            existing = env.get("OPENSCADPATH", "")
+            all_paths = lib_paths + ([existing] if existing else [])
+            env["OPENSCADPATH"] = os.pathsep.join(all_paths)
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(self.workspace),
+            env=env,
         )
         try:
             stdout_b, stderr_b = await asyncio.wait_for(
