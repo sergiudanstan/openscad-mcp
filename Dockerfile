@@ -4,7 +4,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     MCP_TRANSPORT=streamable-http \
-    PORT=8080 \
+    PORT=7860 \
     HOME=/home/app
 
 # OpenSCAD CLI + Xvfb (PNG previews need an X display even in CLI mode)
@@ -37,6 +37,6 @@ RUN pip install --no-cache-dir .
 RUN chown -R app:app /home/app
 USER app
 
-EXPOSE 8080
+EXPOSE 7860
 
 CMD ["python", "-m", "openscad_mcp"]
