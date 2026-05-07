@@ -10,7 +10,6 @@ services:
     plan: free
     region: frankfurt
     dockerfilePath: ./Dockerfile
-    healthCheckPath: /
     autoDeploy: true
     envVars:
       - key: MCP_TRANSPORT
