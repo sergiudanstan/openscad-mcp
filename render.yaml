@@ -1,0 +1,19 @@
+# render.yaml — Render Blueprint for openscad-mcp
+# After pushing this file to GitHub, sign in to Render and:
+#   New → Blueprint → connect this repo
+# Render will read this file and provision the service automatically.
+
+services:
+  - type: web
+    name: openscad-mcp
+    runtime: docker
+    plan: free
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: MCP_TRANSPORT
+        value: streamable-http
+      - key: PORT
+        value: "8080"
