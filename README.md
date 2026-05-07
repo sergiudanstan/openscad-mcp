@@ -1,3 +1,13 @@
+---
+title: OpenSCAD MCP
+emoji: "\U0001F4D0"
+colorFrom: blue
+colorTo: green
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # OpenSCAD MCP Server
 
 An MCP (Model Context Protocol) server that lets AI assistants like Claude create, edit, render, and export 3D models using [OpenSCAD](https://openscad.org/).
