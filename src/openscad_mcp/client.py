@@ -1,9 +1,11 @@
 """Subprocess wrapper for the OpenSCAD CLI."""
 
 import asyncio
+import json
 import logging
 import os
 import shutil
+import tempfile
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -11,6 +13,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_WORKSPACE = Path.home() / "openscad-mcp-workspace"
 DEFAULT_LIBRARIES = Path.home() / "Documents" / "OpenSCAD" / "libraries"
 RENDER_TIMEOUT = 60  # seconds
+_STATS_KEYS = {"Simple", "Vertices", "Halfedges", "Edges", "Halffacets", "Facets", "Volumes"}
 
 
 class OpenSCADClient:
@@ -197,10 +200,14 @@ class OpenSCADClient:
     async def check_syntax(self, scad_file: str) -> tuple[int, str, str]:
         """Dry-run a .scad file to check for syntax errors."""
         src = self.resolve_path(scad_file)
-        # Export to /dev/null (or nul on Windows) to trigger parse without render
-        null = "/dev/null" if os.name != "nt" else "NUL"
-        args = ["-o", null, str(src)]
-        return await self.run(args, timeout=15)
+        # Echo export parses and evaluates without a CGAL render. OpenSCAD
+        # writes parser errors and warnings into the .echo file, not stderr.
+        with tempfile.TemporaryDirectory() as tmp:
+            echo_file = Path(tmp) / "check.echo"
+            rc, stdout, stderr = await self.run(["-o", str(echo_file), str(src)], timeout=15)
+            if echo_file.exists():
+                stderr = echo_file.read_text(errors="replace") + stderr
+        return rc, stdout, stderr
 
     async def render_animated(
         self,
@@ -233,4 +240,24 @@ class OpenSCADClient:
         summary = self.resolve_path(summary_file)
         null = "/dev/null" if os.name != "nt" else "NUL"
         args = ["-o", null, "--summary-file", str(summary), str(src)]
-        return await self.run(args)
+        rc, stdout, stderr = await self.run(args)
+        if rc == 0 or "--summary-file" not in stderr:
+            return rc, stdout, stderr
+
+        # OpenSCAD < 2023 has no --summary-file: render to STL and parse the
+        # "Top level object" stats it prints to stderr instead.
+        args = ["-o", null, "--export-format", "binstl", str(src)]
+        rc, stdout, stderr = await self.run(args)
+        if rc != 0:
+            return rc, stdout, stderr
+        geometry: dict = {}
+        for line in stderr.splitlines():
+            key, sep, value = line.strip().partition(":")
+            if sep and key in _STATS_KEYS:
+                value = value.strip()
+                geometry[key.lower()] = int(value) if value.isdigit() else value
+            elif line.strip().startswith("Total rendering time:"):
+                geometry["render_time"] = line.split(":", 1)[1].strip()
+        summary.write_text(json.dumps({"geometry": geometry}, indent=2))
+        stderr = "\n".join(l for l in stderr.splitlines() if not l.startswith("CGAL Cache"))
+        return rc, stdout, stderr
