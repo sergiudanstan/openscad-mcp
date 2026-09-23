@@ -83,6 +83,14 @@ Add to your Claude Desktop config:
 
 Restart Claude Desktop — the OpenSCAD tools will appear in the hammer icon.
 
+### Configure Claude Code
+
+```bash
+claude mcp add openscad -s user -- /full/path/to/openscad-mcp/.venv/bin/python -m openscad_mcp
+```
+
+Start a new Claude Code session and the `openscad_*` tools will be available.
+
 ## Examples
 
 The `examples/` directory includes sample `.scad` files:

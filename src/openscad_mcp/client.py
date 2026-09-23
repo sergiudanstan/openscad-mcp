@@ -125,6 +125,8 @@ class OpenSCADClient:
 
         stdout = stdout_b.decode(errors="replace")
         stderr = stderr_b.decode(errors="replace")
+        # Drop CGAL cache chatter: one line per cached node, no diagnostic value
+        stderr = "\n".join(l for l in stderr.splitlines() if not l.startswith("CGAL Cache"))
         return proc.returncode, stdout, stderr
 
     # ------------------------------------------------------------------
@@ -259,5 +261,4 @@ class OpenSCADClient:
             elif line.strip().startswith("Total rendering time:"):
                 geometry["render_time"] = line.split(":", 1)[1].strip()
         summary.write_text(json.dumps({"geometry": geometry}, indent=2))
-        stderr = "\n".join(l for l in stderr.splitlines() if not l.startswith("CGAL Cache"))
         return rc, stdout, stderr
