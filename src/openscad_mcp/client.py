@@ -360,7 +360,8 @@ class OpenSCADClient:
                     return MeshResult(True, stl, 0, meta.get("output", ""), meta.get("diagnostics", {}),
                                       cached=True, dimension=3)
             except (OSError, ValueError):
-                pass
+                # Unreadable or corrupt cache entry: ignore it and render afresh below.
+                logger.debug("Ignoring unreadable cache entry %s", entry)
 
         entry.mkdir(parents=True, exist_ok=True)
         tag = secrets.token_hex(6)
@@ -604,7 +605,8 @@ async def _kill(proc: asyncio.subprocess.Process) -> None:
         try:
             proc.kill()
         except ProcessLookupError:
-            pass
+            # The process exited between the returncode check and kill(); nothing to stop.
+            logger.debug("OpenSCAD process already exited")
         await proc.wait()
 
 
