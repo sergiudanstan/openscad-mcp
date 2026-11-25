@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openscad-mcp"
-version = "0.3.0"
+version = "0.4.0"
 description = "MCP server for OpenSCAD: model, preview (inline images), measure, analyse and export via the CLI"
 requires-python = ">=3.10"
 dependencies = [

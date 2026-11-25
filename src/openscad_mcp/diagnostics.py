@@ -20,6 +20,7 @@ _NOISE = (
     "Loaded design",
     "Parsing design",
     "Rendering design",
+    "Fontconfig warning:",
 )
 
 _LOC = re.compile(r'in file "?(?P<file>[^,"]+?)"?, line (?P<line>\d+)')
