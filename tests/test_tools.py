@@ -132,9 +132,9 @@ class TestLibraryTools:
     async def test_list_files_empty_workspace(self, client: OpenSCADClient) -> None:
         """openscad_list_files returns empty list for an empty workspace."""
         from openscad_mcp.tools.library_tools import register_library_tools
-        from mcp.server.fastmcp import FastMCP
+        from mcp.server.mcpserver import MCPServer
 
-        mcp = FastMCP("test")
+        mcp = MCPServer("test")
         register_library_tools(mcp)
 
         # Retrieve the registered tool function by calling it directly
@@ -151,12 +151,12 @@ class TestLibraryTools:
     async def test_list_files_finds_scad(self, client: OpenSCADClient) -> None:
         """openscad_list_files finds .scad files placed in the workspace."""
         from openscad_mcp.tools.library_tools import register_library_tools
-        from mcp.server.fastmcp import FastMCP
+        from mcp.server.mcpserver import MCPServer
 
         # Create a dummy .scad file in the workspace
         (client.workspace / "test_model.scad").write_text("cube(1);")
 
-        mcp = FastMCP("test")
+        mcp = MCPServer("test")
         register_library_tools(mcp)
         ctx = _make_ctx(client)
 
@@ -169,9 +169,9 @@ class TestLibraryTools:
     async def test_cheatsheet_content(self, client: OpenSCADClient) -> None:
         """openscad_cheatsheet returns a non-empty string with key terms."""
         from openscad_mcp.tools.library_tools import register_library_tools
-        from mcp.server.fastmcp import FastMCP
+        from mcp.server.mcpserver import MCPServer
 
-        mcp = FastMCP("test")
+        mcp = MCPServer("test")
         register_library_tools(mcp)
         ctx = _make_ctx(client)
 
@@ -187,9 +187,9 @@ class TestLibraryTools:
     async def test_version_mock(self, client: OpenSCADClient) -> None:
         """openscad_version returns JSON with version key."""
         from openscad_mcp.tools.library_tools import register_library_tools
-        from mcp.server.fastmcp import FastMCP
+        from mcp.server.mcpserver import MCPServer
 
-        mcp = FastMCP("test")
+        mcp = MCPServer("test")
         register_library_tools(mcp)
         ctx = _make_ctx(client)
 
@@ -204,9 +204,9 @@ class TestLibraryTools:
     async def test_check_syntax_pass_mock(self, client: OpenSCADClient) -> None:
         """openscad_check_syntax returns passed=True when returncode is 0."""
         from openscad_mcp.tools.library_tools import register_library_tools
-        from mcp.server.fastmcp import FastMCP
+        from mcp.server.mcpserver import MCPServer
 
-        mcp = FastMCP("test")
+        mcp = MCPServer("test")
         register_library_tools(mcp)
         ctx = _make_ctx(client)
 
@@ -223,9 +223,9 @@ class TestLibraryTools:
     async def test_check_syntax_fail_mock(self, client: OpenSCADClient) -> None:
         """openscad_check_syntax returns passed=False on non-zero returncode."""
         from openscad_mcp.tools.library_tools import register_library_tools
-        from mcp.server.fastmcp import FastMCP
+        from mcp.server.mcpserver import MCPServer
 
-        mcp = FastMCP("test")
+        mcp = MCPServer("test")
         register_library_tools(mcp)
         ctx = _make_ctx(client)
 
@@ -243,9 +243,9 @@ class TestLibraryTools:
     async def test_list_examples(self, client: OpenSCADClient) -> None:
         """openscad_list_examples returns JSON with examples list."""
         from openscad_mcp.tools.library_tools import register_library_tools
-        from mcp.server.fastmcp import FastMCP
+        from mcp.server.mcpserver import MCPServer
 
-        mcp = FastMCP("test")
+        mcp = MCPServer("test")
         register_library_tools(mcp)
         ctx = _make_ctx(client)
 

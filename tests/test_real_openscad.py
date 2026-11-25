@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from openscad_mcp.client import OpenSCADClient
 from openscad_mcp.tools.design_tools import register_design_tools
@@ -36,7 +36,7 @@ def real_client(tmp_path: Path) -> OpenSCADClient:
 
 @pytest.fixture()
 def tools(real_client: OpenSCADClient):
-    mcp = FastMCP("test")
+    mcp = MCPServer("test")
     register_design_tools(mcp)
     register_render_tools(mcp)
     register_library_tools(mcp)

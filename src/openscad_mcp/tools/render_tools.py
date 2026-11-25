@@ -3,12 +3,12 @@
 import json
 from pathlib import Path
 
-from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.mcpserver import Context, MCPServer
 
 SUPPORTED_EXPORT_FORMATS = {"stl", "3mf", "off", "amf", "dxf", "svg", "pdf"}
 
 
-def register_render_tools(mcp: FastMCP) -> None:
+def register_render_tools(mcp: MCPServer) -> None:
     """Register render and export tools with the MCP server."""
 
     @mcp.tool()

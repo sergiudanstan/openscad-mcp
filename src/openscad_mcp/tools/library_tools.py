@@ -3,7 +3,7 @@
 import json
 from pathlib import Path
 
-from mcp.server.fastmcp import FastMCP, Context
+from mcp.server.mcpserver import MCPServer, Context
 
 # Examples directory: openscad-mcp/examples/ (two package levels + src + project root)
 _EXAMPLES_DIR = Path(__file__).resolve().parent.parent.parent.parent / "examples"
@@ -175,7 +175,7 @@ OpenSCAD Quick Reference (v2021.01)
 """
 
 
-def register_library_tools(mcp: FastMCP) -> None:
+def register_library_tools(mcp: MCPServer) -> None:
     """Register library / utility tools with the MCP server."""
 
     @mcp.tool()
