@@ -1,0 +1,42 @@
+name: OpenSSF Scorecard
+
+# Independent, automated assessment of this repository's supply-chain posture.
+# Some checks cannot pass for a single-maintainer project (Code-Review needs
+# reviewed pull requests by someone else, Contributors needs several
+# organisations, Fuzzing needs OSS-Fuzz). Those are expected, not worked around.
+on:
+  schedule:
+    - cron: "41 5 * * 1"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analysis:
+    name: scorecard analysis
+    runs-on: ubuntu-24.04
+    permissions:
+      security-events: write
+      id-token: write
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ossf/scorecard-action@23f22cd43608bae7a1f1fa2603d7314dee9538a5 # v2.6.0
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: scorecard-results
+          path: results.sarif
+          retention-days: 5
+      - uses: github/codeql-action/upload-sarif@38112626f97ac1fd7acf3df7ebca51f4677c1b38 # codeql-bundle-v2.27.6
+        with:
+          sarif_file: results.sarif
