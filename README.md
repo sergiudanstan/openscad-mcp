@@ -10,10 +10,14 @@ pinned: false
 
 # OpenSCAD MCP Server
 
+[![CI](https://github.com/sergiudanstan/openscad-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/sergiudanstan/openscad-mcp/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/sergiudanstan/openscad-mcp/actions/workflows/codeql.yml/badge.svg)](https://github.com/sergiudanstan/openscad-mcp/actions/workflows/codeql.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/sergiudanstan/openscad-mcp/badge)](https://scorecard.dev/viewer/?uri=github.com/sergiudanstan/openscad-mcp)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 An MCP (Model Context Protocol) server that lets AI assistants like Claude create, edit, render, and export 3D models using [OpenSCAD](https://openscad.org/).
 
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
-![License](https://img.shields.io/badge/license-MIT-green)
 
 ## What It Does
 
@@ -42,6 +46,8 @@ Connect this server to Claude Desktop and you can ask Claude to:
 | `openscad_cheatsheet` | OpenSCAD language quick reference |
 | `openscad_version` | Get installed OpenSCAD version |
 | `openscad_list_examples` | List built-in example files |
+| `openscad_list_libraries` | List installed OpenSCAD libraries |
+| `openscad_library_info` | Files and README excerpt of one installed library |
 
 ## Quick Start
 
@@ -118,8 +124,9 @@ openscad-mcp/
 ## Security
 
 - **No shell injection** — uses `subprocess_exec` (argument list, not shell string)
-- **Path traversal protection** — all file operations are sandboxed to the workspace directory
-- **No credentials or API keys** — runs entirely locally
+- **Path traversal protection** — file names passed to the tools are confined to the workspace directory
+- **No credentials or API keys** — runs locally and makes no outgoing network calls
+- **HTTP mode is unauthenticated** — with `MCP_TRANSPORT=streamable-http` or `sse` the server listens on `0.0.0.0` with host validation disabled; see [SECURITY.md](SECURITY.md) before exposing it
 
 ## Workspace
 
@@ -129,9 +136,18 @@ All files are created in `~/openscad-mcp-workspace/` by default.
 
 ```bash
 pip install -e ".[dev]"
-pytest tests/
+pytest tests/   # tests that run the real CLI need `openscad` on PATH
 ```
 
 ## Full Installation Guide
 
 See [openscad-mcp-install-guide.pdf](openscad-mcp-install-guide.pdf) for detailed step-by-step instructions for macOS and Windows.
+
+## Development
+
+```bash
+uv sync --locked --extra dev      # or: pip install -e ".[dev]"
+uv run pytest -q tests            # real-CLI tests need `openscad` on PATH
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md) and [CHANGELOG.md](CHANGELOG.md).

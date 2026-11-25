@@ -1,0 +1,38 @@
+name: CodeQL
+
+# Every push to main, every pull request, and weekly. Keeping it on every change
+# keeps Scorecard's SAST check covering all commits.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "27 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: analyze ${{ matrix.language }}
+    runs-on: ubuntu-24.04
+    permissions:
+      security-events: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [python, actions]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@38112626f97ac1fd7acf3df7ebca51f4677c1b38 # codeql-bundle-v2.27.6
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          queries: security-and-quality
+      - uses: github/codeql-action/analyze@38112626f97ac1fd7acf3df7ebca51f4677c1b38 # codeql-bundle-v2.27.6
+        with:
+          category: /language:${{ matrix.language }}

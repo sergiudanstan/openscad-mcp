@@ -1,0 +1,30 @@
+version: 2
+updates:
+  # Workflow actions are pinned to commit SHAs; Dependabot updates them while
+  # keeping the pin, so pinning does not mean going stale.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    labels: [dependencies, ci]
+    commit-message:
+      prefix: "ci"
+
+  # Python dependencies pinned in uv.lock (declared in pyproject.toml).
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels: [dependencies, security]
+    commit-message:
+      prefix: "deps"
+
+  # The container image that the Render deployment builds.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    labels: [dependencies]
+    commit-message:
+      prefix: "deps"

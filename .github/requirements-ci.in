@@ -1,0 +1,5 @@
+zizmor
+pip-audit
+cyclonedx-bom
+ruff
+pytest>=8.0

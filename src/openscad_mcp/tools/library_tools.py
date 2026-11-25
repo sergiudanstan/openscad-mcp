@@ -301,6 +301,9 @@ def register_library_tools(mcp: FastMCP) -> None:
         try:
             client = ctx.request_context.lifespan_context["client"]
             lib_dir = client.libraries / library_name
+            # A library is a direct child of the libraries directory (it may itself be a symlink).
+            if Path(library_name).name != library_name or library_name in ("", ".", ".."):
+                return json.dumps({"error": f"Library not found: {library_name}"})
             if not lib_dir.is_dir():
                 return json.dumps({"error": f"Library not found: {library_name}"})
 
