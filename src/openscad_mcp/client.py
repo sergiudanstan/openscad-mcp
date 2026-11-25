@@ -73,6 +73,7 @@ class MeshResult:
     cached: bool = False
     dimension: int | None = None
     summary: dict[str, Any] | None = None
+    deps_changed: bool = False  # an input was modified while OpenSCAD rendered
 
 
 @dataclass
@@ -266,7 +267,7 @@ class OpenSCADClient:
         thrash the machine. CGAL cache chatter is removed from stderr.
         """
         if self.binary is None or not self._probed:
-            self.ensure_ready()
+            await asyncio.to_thread(self.ensure_ready)
         timeout = timeout or RENDER_TIMEOUT
         cmd = [self.binary, *args]
         logger.debug("Running: %s", " ".join(map(str, cmd)))
@@ -410,6 +411,7 @@ class OpenSCADClient:
             return None
         try:
             os.utime(meta_file)  # last use, for eviction
+            os.utime(stl)  # still in use if a newer render replaces it
         except OSError:
             logger.debug("Could not touch %s", meta_file)
         return MeshResult(True, stl, 0, meta.get("output", ""), meta.get("diagnostics", {}),
@@ -439,11 +441,18 @@ class OpenSCADClient:
         # The source digest keeps a call made after an edit from joining a
         # render of the previous text.
         name = f"{key}:{self._digest([str(src)])[str(src)]}"
-        return await self._single_flight(name, lambda: self._render_mesh(key, src, parameters, timeout, extra))
+        res, joined = await self._single_flight(name, lambda: self._render_mesh(key, src, parameters, timeout, extra))
+        if joined and res.ok and res.deps_changed:
+            # An included or imported file changed while the render this call joined
+            # was running, so its mesh may predate the edit: render the files as they are.
+            res, _ = await self._single_flight(name, lambda: self._render_mesh(key, src, parameters, timeout, extra))
+        return res
 
-    async def _single_flight(self, name: str, factory) -> MeshResult:
+    async def _single_flight(self, name: str, factory) -> tuple[MeshResult, bool]:
+        """(result, joined): joined is true when another call had started the render."""
         flight = self._flights.get(name)
-        if flight is None or flight.task.done():  # a finished (or cancelled) render is not joined
+        joined = flight is not None and not flight.task.done()
+        if not joined:  # a finished or cancelled render is never joined
             flight = self._flights[name] = _Flight(asyncio.ensure_future(factory()))
 
             def done(task: asyncio.Future, name: str = name, flight: _Flight = flight) -> None:
@@ -455,18 +464,22 @@ class OpenSCADClient:
             flight.task.add_done_callback(done)
         flight.waiters += 1
         try:
-            return await asyncio.shield(flight.task)
+            return await asyncio.shield(flight.task), joined
         finally:
             flight.waiters -= 1
             if flight.waiters == 0 and not flight.task.done():
-                # Every caller went away (cancelled requests): stop the render.
+                # Every caller went away (cancelled requests): stop the render, and
+                # forget it now so a new call does not join it while it is dying.
                 flight.task.cancel()
+                if self._flights.get(name) is flight:
+                    del self._flights[name]
 
     async def _render_mesh(
         self, key: str, src: Path, parameters: dict[str, Any] | None, timeout: float | None, extra: list[str]
     ) -> MeshResult:
         entry = self.cache_dir / "mesh" / key
         entry.mkdir(parents=True, exist_ok=True)
+        os.utime(entry)  # in use: the sweep leaves recently touched entries alone
         tag = secrets.token_hex(6)
         stl = entry / f"mesh.{tag}.stl"
         deps_file = entry / f"deps.{tag}.mk"
@@ -515,8 +528,9 @@ class OpenSCADClient:
                 tmp_meta = entry / f"meta.{tag}.tmp"
                 tmp_meta.write_text(json.dumps(meta))
                 os.replace(tmp_meta, entry / "meta.json")
-                self._maybe_sweep(keep=entry)
-            return MeshResult(True, stl, rc, output, diag, cached=False, dimension=3, summary=summary)
+            self._maybe_sweep(keep=entry)
+            return MeshResult(True, stl, rc, output, diag, cached=False, dimension=3, summary=summary,
+                              deps_changed=changed)
         finally:
             if not keep:
                 stl.unlink(missing_ok=True)
@@ -533,7 +547,7 @@ class OpenSCADClient:
                 logger.debug("Cache sweep failed", exc_info=True)
 
     def evict(self, keep: Path | None = None, max_bytes: float | None = None,
-              idle_s: float = 600.0) -> dict[str, Any]:
+              idle_s: float = 3600.0) -> dict[str, Any]:
         """Keep the cache under OPENSCAD_MCP_CACHE_MAX_MB (default 512).
 
         Meshes no entry refers to any more (replaced, or from renders that could
@@ -557,6 +571,7 @@ class OpenSCADClient:
             except (OSError, ValueError, AttributeError):
                 live, last = None, 0.0
             size = 0
+            newest = d.stat(follow_symlinks=False).st_mtime
             for f in os.scandir(entry):
                 try:
                     st = f.stat(follow_symlinks=False)
@@ -566,6 +581,17 @@ class OpenSCADClient:
                     Path(f.path).unlink(missing_ok=True)
                 else:
                     size += st.st_size
+                    newest = max(newest, st.st_mtime)
+            # An entry without meta.json is a render in progress or a mesh that could not
+            # be cached: its newest file says when it was last used.
+            last = max(last, newest)
+            if size == 0:
+                if now - last > 86400:
+                    try:
+                        entry.rmdir()  # left by renders that failed a day ago
+                    except OSError:
+                        pass
+                continue
             entries.append((last, size, entry))
             total += size
         removed = 0

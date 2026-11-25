@@ -39,9 +39,12 @@ and render statistics all reuse it. Parallel calls for the same model share one 
 v0.3 (every step re-rendered) and takes 36 s now, all of it the first render. With an OpenSCAD build that
 has the Manifold backend, the server uses it automatically.
 
+A model whose `include`/`use` cannot be found is not cached (its dependency list is incomplete), so
+each call renders it again until the file is found; the result's warnings say which file is missing.
+
 Results are kept small for the model reading them: repeated warnings are merged into one entry with a
-line list, echo output is capped (all of it in `openscad_check_syntax`), and multi-view previews use
-512×384 tiles unless a size is given.
+line list, echo output is capped at 10 lines (200 in `openscad_check_syntax`; the first and last half
+are kept), and multi-view previews use 512×384 tiles unless a size is given.
 
 ## Available Tools
 

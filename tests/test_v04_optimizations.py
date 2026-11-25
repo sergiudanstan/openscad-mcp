@@ -8,6 +8,8 @@ moves), so a path that does nothing cannot pass.
 import asyncio
 import json
 import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -147,18 +149,92 @@ class TestSharedRender:
             await make(tools, f"e{i}.scad", f"cube({i + 1});")
             await tools("openscad_measure")(filename=f"e{i}.scad")
         mesh = real_client.cache_dir / "mesh"
-        entries = sorted(mesh.iterdir())
-        assert len(entries) == 3
+        by_model = {Path(json.loads((e / "meta.json").read_text())["source"]).name: e for e in mesh.iterdir()}
+        assert sorted(by_model) == ["e0.scad", "e1.scad", "e2.scad"]
         old = time.time() - 7200
-        for e in entries[:2]:
-            os.utime(e / "meta.json", (old, old))
-        orphan = entries[2] / "mesh.deadbeef0000.stl"
+        for name in ("e0.scad", "e1.scad"):  # unused for two hours
+            for f in [*by_model[name].iterdir(), by_model[name]]:
+                os.utime(f, (old, old))
+        orphan = by_model["e2.scad"] / "mesh.deadbeef0000.stl"
         orphan.write_bytes(b"x" * 10)
         os.utime(orphan, (old, old))
         res = real_client.evict(max_bytes=0)  # over the cap: drop all idle entries
-        assert res["entries_removed"] == 2 and sorted(mesh.iterdir()) == [entries[2]]
+        assert res["entries_removed"] == 2 and list(mesh.iterdir()) == [by_model["e2.scad"]]
         assert not orphan.exists()
         assert (await tools("openscad_measure")(filename="e2.scad"))["cached"] is True
+
+    async def test_eviction_spares_fresh_entries_without_meta(self, tools, real_client):
+        """An uncacheable render (missing include) has no meta.json but its mesh is in use."""
+        await make(tools, "u.scad", "include <nothere.scad>\ncube(3);\n")
+        res = await real_client.render_mesh(real_client.workspace / "u.scad")
+        assert res.ok and not (res.stl.parent / "meta.json").exists()
+        real_client.evict(max_bytes=0)
+        assert res.stl.exists()
+        await make(tools, "f.scad", "cube(1);\nassert(false);\n")  # a failed render leaves an empty entry
+        assert not (await real_client.render_mesh(real_client.workspace / "f.scad")).ok
+        empty = [e for e in (real_client.cache_dir / "mesh").iterdir() if not any(e.iterdir())]
+        assert len(empty) == 1
+        real_client.evict()
+        assert empty[0].exists()  # recent: a render may be about to write there
+        day_old = time.time() - 2 * 86400
+        os.utime(empty[0], (day_old, day_old))
+        real_client.evict()
+        assert not empty[0].exists()
+
+    async def test_cancelled_render_is_not_joined_by_a_new_call(self, real_client):
+        gate = asyncio.Event()
+        calls = []
+        real_run = real_client.run
+
+        async def run(args, timeout=None):
+            calls.append(args)
+            if len(calls) == 1:
+                try:
+                    await asyncio.sleep(30)
+                except asyncio.CancelledError:
+                    await gate.wait()  # still cleaning up when the next call arrives
+                    raise
+            return await real_run(args, timeout=timeout)
+
+        src = real_client.workspace / "c.scad"
+        src.write_text("cube(2);")
+        real_client.ensure_ready()
+        with patch.object(real_client, "run", run):
+            first = asyncio.ensure_future(real_client.render_mesh(src))
+            while not calls:
+                await asyncio.sleep(0.01)
+            first.cancel()
+            await asyncio.sleep(0.01)
+            second = asyncio.ensure_future(real_client.render_mesh(src))
+            await asyncio.sleep(0.01)
+            gate.set()
+            res = await asyncio.wait_for(second, 30)
+        assert res.ok and len(calls) == 2
+
+    async def test_joiner_rerenders_when_an_include_changes_mid_render(self, tools, real_client):
+        await make(tools, "inc.scad", "s = 2;\n")
+        await make(tools, "m.scad", "include <inc.scad>\ncube(s);\n")
+        src = real_client.workspace / "m.scad"
+        real_run = real_client.run
+        started = asyncio.Event()
+
+        async def run(args, timeout=None):
+            if not started.is_set():
+                started.set()
+                await asyncio.sleep(0.3)
+                out = await real_run(args, timeout=timeout)
+                (real_client.workspace / "inc.scad").write_text("s = 5;\n")  # saved while rendering
+                return out
+            return await real_run(args, timeout=timeout)
+
+        real_client.ensure_ready()
+        with patch.object(real_client, "run", run):
+            first = asyncio.ensure_future(real_client.render_mesh(src))
+            await started.wait()
+            joiner = await real_client.render_mesh(src)
+            await first
+        sizes = geometry.mesh_stats(geometry.read_stl(joiner.stl)).to_dict()["bbox"]["size"]
+        assert sizes == [5, 5, 5]
 
 
 class TestSection:
@@ -184,6 +260,17 @@ class TestSection:
         assert side["bbox_2d"]["min"] == [0, -10] and side["bbox_2d"]["max"] == [30, 0]
         assert _meta(await cut(axis="x", offset=40))["note"] == "The plane does not cut the model."
 
+    async def test_body_standing_on_the_plane_and_inside_out_mesh(self, tools):
+        await make(tools, "stack.scad", "cube([10, 10, 5]); translate([20, 0, 5]) cube([4, 4, 5]);")
+        on = _meta(await tools("openscad_section")(filename="stack.scad", offset=5, return_image=False))
+        assert on["area"] == pytest.approx(116) and on["regions"] == 2 and "stands on the plane" in on["note"]
+        # A polyhedron wound inside out (OpenSCAD exports it as written): regions still counts it.
+        pts = "[[0,0,-5],[5,0,0],[0,5,0],[-5,0,0],[0,-5,0],[0,0,5]]"
+        faces = "[[0,1,2],[0,2,3],[0,3,4],[0,4,1],[5,2,1],[5,3,2],[5,4,3],[5,1,4]]"  # inward normals
+        await make(tools, "inv.scad", f"polyhedron(points={pts}, faces={faces});")
+        inv = _meta(await tools("openscad_section")(filename="inv.scad", offset=1, return_image=False))
+        assert inv["area"] == pytest.approx(2 * 4 ** 2) and inv["regions"] == 1
+
     async def test_section_image_is_returned(self, tools):
         await make(tools, "ring.scad", "difference() { cylinder(d=20, h=5, $fn=48); translate([0, 0, -1]) cylinder(d=10, h=7, $fn=48); }")
         out = await tools("openscad_section")(filename="ring.scad", offset=2.5, width=200, height=150)
@@ -204,6 +291,22 @@ class TestInterference:
         await make(tools, "block.scad", "translate([12, 11, 1]) cube([2, 2, 2]);")
         moved = await tools("openscad_interference")(file_a="edges.scad", file_b="block.scad")
         assert moved["interference_volume"] == pytest.approx(8, rel=1e-6)
+
+    async def test_thin_pins_through_a_non_manifold_plate_are_found(self, tools):
+        """A 64-cell grid misses 0.4 mm pins; the fallback must refine before saying touching."""
+        await make(tools, "plate.scad", "cube([100, 100, 5]); translate([100, 100, 5]) cube(1);")
+        await make(tools, "pins.scad", "translate([20.3, 33.3, -2]) cylinder(d=0.4, h=9, $fn=12);\n"
+                   "translate([70.1, 60.6, -2]) cylinder(d=0.4, h=9, $fn=12);")
+        hit = await tools("openscad_interference")(file_a="plate.scad", file_b="pins.scad")
+        assert hit["method"] == "ray_sampled" and hit["status"] == "interference"
+        assert hit["interference_volume"] > 0 and "can be missed" in hit["note"]
+
+    def test_face_contact_is_not_interference(self):
+        a, b = _box((0, 0, 0), (10, 10, 10)), _box((10, 0, 0), (20, 10, 10))
+        bb = lambda t: (tuple(min(p[i] for tri in t for p in tri) for i in range(3)),  # noqa: E731
+                        tuple(max(p[i] for tri in t for p in tri) for i in range(3)))
+        est = geometry.ray_overlap(a, b, bb(a), bb(b))
+        assert est["status"] == "touching_or_near" and est["volume"] == 0.0
 
     def test_ray_overlap_matches_exact_volumes(self):
         cube = lambda lo, hi: [(a, b, c) for a, b, c in _box(lo, hi)]  # noqa: E731
@@ -267,7 +370,12 @@ class TestCompactResults:
         assert d["warnings"][1] == {"message": "Ignoring unknown module 'foo'", "file": "m.scad", "line": 3}
         assert d["errors"][0]["line"] == 20 and d["errors"][0]["trace"]
         assert d["notes"] == ["DEPRECATED: The assign() module will be removed in file m.scad, line 1"]
-        assert len(d["echo"]) == 10 and d["echo_omitted"] == 20
+        assert d["echo"][:5] == ["0", "1", "2", "3", "4"] and d["echo"][-5:] == ["25", "26", "27", "28", "29"]
+        assert d["echo"][5] == "... 20 echo lines omitted ..." and d["echo_omitted"] == 20
+        same_line = compact_diag(diagnostics.parse_output(
+            "\n".join(["WARNING: Ignoring unknown variable 'q' in file m.scad, line 1"] * 5)))
+        assert same_line["warnings"] == [{"message": "Ignoring unknown variable 'q'", "file": "m.scad", "line": 1,
+                                          "count": 5}]
 
     async def test_check_syntax_reports_deprecations_without_a_console_dump(self, tools):
         await make(tools, "dep.scad", "assign(x = 1) cube(x);\n")
@@ -310,3 +418,106 @@ class TestServerRobustness:
         real_client.kill_children()
         rc, _, _ = await asyncio.wait_for(task, 5)
         assert rc != 0 and not real_client._procs
+
+
+class _StdioServer:
+    """The real server process, spoken to over stdio JSON-RPC as a host does."""
+
+    def __init__(self, tmp_path: Path, binary: Path, **env: str) -> None:
+        full = dict(os.environ, OPENSCAD_BINARY=str(binary), MCP_TRANSPORT="stdio",
+                    OPENSCAD_MCP_WORKSPACE=str(tmp_path / "ws"), OPENSCAD_MCP_CACHE=str(tmp_path / "cache"),
+                    OPENSCAD_MCP_LIBRARIES=str(tmp_path / "libs"), **env)
+        self.proc = subprocess.Popen([sys.executable, "-m", "openscad_mcp"], stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, env=full)
+        self.next_id = 0
+
+    def send(self, method: str, params: dict | None = None, notify: bool = False) -> int | None:
+        msg: dict = {"jsonrpc": "2.0", "method": method, **({"params": params} if params is not None else {})}
+        if not notify:
+            self.next_id += 1
+            msg["id"] = self.next_id
+        self.proc.stdin.write(json.dumps(msg) + "\n")
+        self.proc.stdin.flush()
+        return None if notify else self.next_id
+
+    def read(self) -> dict:
+        line = self.proc.stdout.readline()
+        assert line, "server closed its output"
+        return json.loads(line)
+
+    def initialize(self) -> float:
+        t = time.monotonic()
+        self.send("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                 "clientInfo": {"name": "test", "version": "0"}})
+        assert "result" in self.read()
+        self.send("notifications/initialized", notify=True)
+        return time.monotonic() - t
+
+    def close(self) -> None:
+        if self.proc.poll() is None:
+            self.proc.kill()
+        self.proc.wait(10)
+
+
+def _fake_openscad(tmp_path: Path, probe_delay: float = 0.0) -> Path:
+    """A stand-in binary: answers the probe (after probe_delay) and 'renders'
+    by sleeping, writing its pid so the test can look for orphans."""
+    script = tmp_path / "fake-openscad"
+    script.write_text(
+        "#!/bin/sh\n"
+        f'case "$1" in --version|--help) sleep {probe_delay}; echo "OpenSCAD version 2021.01" >&2; '
+        'echo "--export-format"; exit 0;; esac\n'
+        'echo $$ > "$FAKE_PID_FILE"\n'
+        "exec sleep 60\n"
+    )
+    script.chmod(0o755)
+    return script
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals and shell")
+class TestStdioServer:
+    def test_sigterm_kills_the_render_in_flight(self, tmp_path):
+        pid_file = tmp_path / "render.pid"
+        server = _StdioServer(tmp_path, _fake_openscad(tmp_path), FAKE_PID_FILE=str(pid_file))
+        try:
+            server.initialize()
+            (tmp_path / "ws").mkdir(exist_ok=True)
+            (tmp_path / "ws" / "m.scad").write_text("cube(1);")
+            server.send("tools/call", {"name": "openscad_measure", "arguments": {"filename": "m.scad"}})
+            for _ in range(200):
+                if pid_file.exists() and pid_file.read_text().strip():
+                    break
+                time.sleep(0.05)
+            render = int(pid_file.read_text())
+            assert _alive(render)
+            server.proc.terminate()
+            assert server.proc.wait(10) != 0
+            for _ in range(100):
+                if not _alive(render):
+                    break
+                time.sleep(0.05)
+            assert not _alive(render), "the render outlived the server"
+        finally:
+            server.close()
+
+    def test_slow_probe_does_not_freeze_other_requests(self, tmp_path):
+        server = _StdioServer(tmp_path, _fake_openscad(tmp_path, probe_delay=3), FAKE_PID_FILE=str(tmp_path / "p"))
+        try:
+            assert server.initialize() < 2.5  # the probe runs in the background
+            version_call = server.send("tools/call", {"name": "openscad_version", "arguments": {}})
+            t = time.monotonic()
+            listing = server.send("tools/list", {})
+            first = server.read()
+            assert first["id"] == listing and time.monotonic() - t < 2.0
+            second = server.read()
+            assert second["id"] == version_call and "2021.01" in json.dumps(second["result"])
+        finally:
+            server.close()

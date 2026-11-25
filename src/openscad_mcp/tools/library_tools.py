@@ -228,7 +228,7 @@ def register_library_tools(mcp: MCPServer) -> None:
 
         Symlinked library folders are skipped. `pattern` filters by substring.
         """
-        client = get_client(ctx)
+        client = await get_client(ctx)
         root = client.workspace.resolve()
         files = []
         for p in _workspace_scad_files(root):
@@ -247,7 +247,7 @@ def register_library_tools(mcp: MCPServer) -> None:
     @tool(mcp, annotations=READ_ONLY)
     async def openscad_version(ctx: Context) -> dict[str, Any]:
         """Get the installed OpenSCAD version, binary, geometry backend and paths."""
-        client = get_client(ctx)
+        client = await get_client(ctx)
         version_text = await client.version()
         return {
             "version": version_text,
@@ -269,7 +269,7 @@ def register_library_tools(mcp: MCPServer) -> None:
         Each error/warning carries file and line (`lines` when one message
         repeats); other console output such as DEPRECATED comes as `notes`.
         """
-        client = get_client(ctx)
+        client = await get_client(ctx)
         if not client.resolve_path(filename).is_file():
             fail(f"File not found: {filename}")
         try:
@@ -304,13 +304,13 @@ def register_library_tools(mcp: MCPServer) -> None:
         render tools can use it, and return its source. Sources over 4000
         characters are not inlined when copied (read them with openscad_read);
         include_content=true forces the source, false omits it."""
-        client = get_client(ctx)
+        client = await get_client(ctx)
         fname = name if name.endswith(".scad") else f"{name}.scad"
         src = (_EXAMPLES_DIR / fname).resolve()
         if src.parent != _EXAMPLES_DIR.resolve() or not src.is_file():
             fail(f"Example not found: {name}", available=sorted(p.name for p in _EXAMPLES_DIR.glob("*.scad")))
         code = src.read_text(encoding="utf-8")
-        result: dict[str, Any] = {"name": fname, "bytes": len(code.encode("utf-8")), "lines": code.count("\n") + 1}
+        result: dict[str, Any] = {"name": fname, "bytes": len(code.encode("utf-8")), "lines": len(code.splitlines())}
         inline = include_content if include_content is not None else (
             not copy_to_workspace or len(code) <= INLINE_EXAMPLE_CHARS)
         if inline:
@@ -324,7 +324,8 @@ def register_library_tools(mcp: MCPServer) -> None:
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 dst.write_text(code, encoding="utf-8")
             if not inline:
-                result.setdefault("note", f"Source not inlined; read it with openscad_read(\"examples/{fname}\").")
+                hint = f"Source not inlined; read it with openscad_read(\"examples/{fname}\") or pass include_content=true."
+                result["note"] = f"{result['note']} {hint}" if "note" in result else hint
         return result
 
     @tool(mcp, annotations=READ_ONLY)
@@ -335,7 +336,7 @@ def register_library_tools(mcp: MCPServer) -> None:
           use <LibraryName/module.scad>
           include <LibraryName/module.scad>
         """
-        client = get_client(ctx)
+        client = await get_client(ctx)
         libs = []
         if client.libraries.is_dir():
             for lib_dir in sorted(client.libraries.iterdir()):
@@ -359,7 +360,7 @@ def register_library_tools(mcp: MCPServer) -> None:
         Args:
             library_name: Name of the library (e.g. "BOSL2", "NopSCADlib", "MCAD").
         """
-        client = get_client(ctx)
+        client = await get_client(ctx)
         lib_dir = None
         # A library is a direct child of a libraries directory (it may itself be a symlink).
         if Path(library_name).name == library_name and library_name not in ("", ".", ".."):
@@ -395,5 +396,5 @@ def register_library_tools(mcp: MCPServer) -> None:
     @tool(mcp, annotations=OVERWRITES)
     async def openscad_clear_cache(ctx: Context) -> dict[str, Any]:
         """Delete cached meshes and generated scratch files; reports space freed."""
-        client = get_client(ctx)
+        client = await get_client(ctx)
         return client.clear_cache()

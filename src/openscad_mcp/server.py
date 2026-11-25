@@ -3,6 +3,7 @@ import asyncio
 import logging
 import os
 import signal
+import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -33,8 +34,7 @@ openscad_export. Judge sizes with openscad_measure, not by eye.
 - Engineering: openscad_mass_properties (material/density), openscad_interference
   (two parts), openscad_section (cut plane, wall thickness), openscad_print_report
   (overhangs, bed contact, build volume), openscad_eval (expressions in model scope).
-- One render per model and parameters is cached and shared by measure, analysis,
-  STL export and get_info, so after the first render those calls are fast.
+- One cached render per model and parameters serves measure, analysis, STL export and get_info.
 - Overlap coplanar faces in difference()/union() by 0.01 mm to stay manifold.
 """
 
@@ -47,11 +47,19 @@ def _prepare(client: OpenSCADClient) -> None:
     except OSError as exc:  # includes FileNotFoundError for a missing binary
         # Keep serving: tools report the problem instead of the server dying silently.
         logger.error("%s", exc)
+    try:
+        client.evict()  # bring a cache left over the size cap back under it
+    except OSError:
+        logger.debug("Cache sweep at start failed", exc_info=True)
 
 
 def _install_terminate_handlers(client: OpenSCADClient) -> list[signal.Signals]:
-    """On SIGTERM/SIGHUP (a host quitting or restarting the server) kill running
-    OpenSCAD processes first; otherwise they outlive the server for minutes."""
+    """On SIGTERM/SIGHUP (a host quitting or restarting a stdio server) kill
+    running OpenSCAD processes first; otherwise they outlive the server for
+    minutes. Over HTTP the web server's own graceful shutdown is left alone:
+    the lifespan exit kills what is still running."""
+    if os.environ.get("MCP_TRANSPORT", "stdio").lower() != "stdio":
+        return []
     loop = asyncio.get_running_loop()
 
     def terminate(sig: signal.Signals) -> None:
@@ -74,9 +82,10 @@ def _install_terminate_handlers(client: OpenSCADClient) -> list[signal.Signals]:
 @asynccontextmanager
 async def server_lifespan(server: MCPServer) -> AsyncIterator[dict]:
     client = OpenSCADClient()
-    # Probe the binary in the background: the initialize reply does not wait for
-    # it, and a tool call that arrives first simply finishes the probe itself.
-    probe = asyncio.get_running_loop().run_in_executor(None, _prepare, client)
+    # Probe the binary in a daemon thread: the initialize reply does not wait
+    # for it, a tool call that arrives first waits for it without blocking the
+    # event loop, and shutdown never waits for a hung binary.
+    threading.Thread(target=_prepare, args=(client,), name="openscad-probe", daemon=True).start()
     handlers = _install_terminate_handlers(client)
     try:
         yield {"client": client}
@@ -84,7 +93,7 @@ async def server_lifespan(server: MCPServer) -> AsyncIterator[dict]:
         loop = asyncio.get_running_loop()
         for sig in handlers:
             loop.remove_signal_handler(sig)
-        probe.cancel()
+        client.kill_children()
         logger.info("OpenSCAD MCP server stopped")
 
 

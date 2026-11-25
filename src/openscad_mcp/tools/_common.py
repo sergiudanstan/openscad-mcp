@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import json
 import re
@@ -46,11 +47,13 @@ def tool(server, **kwargs: Any) -> Callable[[Callable[..., Awaitable[Any]]], Cal
     return decorator
 
 
-def get_client(ctx: Context) -> OpenSCADClient:
+async def get_client(ctx: Context) -> OpenSCADClient:
     client: OpenSCADClient = ctx.request_context.lifespan_context["client"]
     if client.binary is None or not client._probed:
         try:
-            client.ensure_ready()
+            # In a thread: the startup probe may still hold the lock, and a slow
+            # binary must not freeze the event loop (other calls, SIGTERM).
+            await asyncio.to_thread(client.ensure_ready)
         except OSError as exc:  # missing binary, or a workspace that cannot be created
             fail(str(exc))
     return client
@@ -69,14 +72,16 @@ def console(text: str) -> str:
 _LOC_TAIL = re.compile(r',?\s*in file "?[^,"]+?"?, line \d+\s*$')
 MAX_ITEMS = 50
 MAX_NOTES = 20
+MAX_LINES_PER_ITEM = 50
 ECHO_LINES = 10
 
 
 def _grouped(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """The location moves from the message text into file/line, and repeats of
-    one message in one file merge into a single entry listing every line."""
+    one message in one file merge into a single entry: `lines` lists each line
+    once, and `count` gives the number of occurrences when a line repeats."""
     out: list[dict[str, Any]] = []
-    seen: dict[tuple[str, Any], dict[str, Any]] = {}
+    groups: dict[tuple[str, Any], tuple[dict[str, Any], list[int], list[int]]] = {}
     for item in items:
         if "line" not in item:
             out.append(item)
@@ -86,22 +91,29 @@ def _grouped(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
             out.append(entry)
             continue
         key = (entry["message"], entry.get("file"))
-        first = seen.get(key)
-        if first is None:
-            seen[key] = entry
+        group = groups.get(key)
+        if group is None:
+            groups[key] = (entry, [entry["line"]], [1])
             out.append(entry)
         else:
-            if "lines" not in first:
-                first["lines"] = [first.pop("line")]
-            first["lines"].append(entry["line"])
+            group[2][0] += 1
+            if entry["line"] not in group[1]:
+                group[1].append(entry["line"])
+    for entry, lines, count in groups.values():
+        if len(lines) > 1:
+            del entry["line"]
+            entry["lines"] = lines[:MAX_LINES_PER_ITEM]
+        if count[0] > len(lines) or len(lines) > MAX_LINES_PER_ITEM:
+            entry["count"] = count[0]
     return out
 
 
 def compact_diag(d: dict[str, Any], echo_lines: int = ECHO_LINES, max_items: int = MAX_ITEMS) -> dict[str, Any]:
     """What OpenSCAD reported, compactly: errors and warnings with repeats
-    merged, the first `echo_lines` echo lines, and any other console lines
-    (DEPRECATED, EXPORT-WARNING, crash text) once each as `notes`. Counts of
-    anything left out are given; empty parts are omitted."""
+    merged, at most `echo_lines` echo lines (the first and the last half, which
+    is where a failure is), and any other console lines (DEPRECATED,
+    EXPORT-WARNING, crash text) once each as `notes`. Counts of anything left
+    out are given; empty parts are omitted."""
     out: dict[str, Any] = {}
     for k in ("errors", "warnings"):
         items = _grouped(d.get(k) or [])
@@ -110,10 +122,14 @@ def compact_diag(d: dict[str, Any], echo_lines: int = ECHO_LINES, max_items: int
             if len(items) > max_items:
                 out[f"{k}_omitted"] = len(items) - max_items
     echo = d.get("echo") or []
-    if echo:
-        out["echo"] = echo[:echo_lines]
-        if len(echo) > echo_lines:
-            out["echo_omitted"] = len(echo) - echo_lines
+    if len(echo) > echo_lines:
+        head = (echo_lines + 1) // 2
+        tail = echo_lines - head
+        omitted = len(echo) - echo_lines
+        out["echo"] = [*echo[:head], f"... {omitted} echo lines omitted ...", *(echo[-tail:] if tail else [])]
+        out["echo_omitted"] = omitted
+    elif echo:
+        out["echo"] = echo
     notes = list(dict.fromkeys(d.get("other") or []))
     if notes:
         out["notes"] = notes[:MAX_NOTES]

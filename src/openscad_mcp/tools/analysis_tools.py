@@ -69,11 +69,13 @@ def _require(res: MeshResult, what: str) -> Path:
 
 
 def _sampled_overlap(sa: Path, sb: Path, ta: geometry.MeshStats, tb: geometry.MeshStats, why: str) -> dict:
-    """Overlap by ray sampling, refined until the error bound is within 5 %."""
+    """Overlap by ray sampling on finer grids until the error estimate is within
+    5 % of the volume; when nothing is hit, up to the finest grid, so thin pins
+    and ribs are not missed by a coarse one."""
     tris_a, tris_b = geometry.read_stl(sa), geometry.read_stl(sb)
     for n in (64, 128, 256):
         est = geometry.ray_overlap(tris_a, tris_b, (ta.bbox_min, ta.bbox_max), (tb.bbox_min, tb.bbox_max), n=n)
-        if est["volume"] == 0 or est["error_bound"] <= 0.05 * est["volume"]:
+        if est["volume"] > 0 and est["error_bound"] <= 0.05 * est["volume"]:
             break
     vol = est["volume"]
     out: dict[str, Any] = {
@@ -81,7 +83,7 @@ def _sampled_overlap(sa: Path, sb: Path, ta: geometry.MeshStats, tb: geometry.Me
         "interference_volume": round(vol, 4),
         "method": "ray_sampled",
         "resolution_mm": [round(h, 6) for h in est["cell"]],
-        "volume_error_bound": round(est["error_bound"], 4),
+        "volume_error_estimate": round(est["error_bound"], 4),
     }
     if est["status"] == "interference":
         lo, hi = est["bbox_min"], est["bbox_max"]
@@ -93,10 +95,8 @@ def _sampled_overlap(sa: Path, sb: Path, ta: geometry.MeshStats, tb: geometry.Me
     if est["invalid_rays"]:
         out["invalid_rays"] = est["invalid_rays"]
         out["volume_is_lower_bound"] = True
-    note = f"{why}; overlap estimated by ray sampling."
-    if est["status"] == "touching_or_near":
-        note += f" Overlaps thinner than about {max(est['cell']):.3g} mm can be missed."
-    out["note"] = note
+    out["note"] = (f"{why}; overlap estimated by ray sampling. Overlaps thinner than about "
+                   f"{max(est['cell']):.3g} mm can be missed.")
     return out
 
 
@@ -130,7 +130,7 @@ def register_analysis_tools(mcp: MCPServer) -> None:
         2D models return area, perimeter, contour count and 2D bbox.
         Prefer this over judging a picture.
         """
-        client = get_client(ctx)
+        client = await get_client(ctx)
         res = await _mesh(client, filename, parameters, timeout, use_cache)
         if not res.ok and res.dimension == 2:
             return {"filename": filename, **await _measure_2d(client, filename, parameters, timeout)}
@@ -161,7 +161,7 @@ def register_analysis_tools(mcp: MCPServer) -> None:
                 rough estimate, since shells are denser than infill.
         Units: mass g, lengths mm, inertia g*mm^2 (divide by 1e9 for kg*m^2).
         """
-        client = get_client(ctx)
+        client = await get_client(ctx)
         if density_g_cm3 is None:
             density_g_cm3 = geometry.MATERIAL_DENSITY.get(material.lower())
             if density_g_cm3 is None:
@@ -196,10 +196,10 @@ def register_analysis_tools(mcp: MCPServer) -> None:
         "touching_or_near" (bboxes overlap, solids do not), or "interference".
         When CGAL cannot intersect them (a part is non-manifold, or it timed
         out), the overlap is estimated by ray sampling instead: method
-        "ray_sampled" with resolution_mm and volume_error_bound, and status
+        "ray_sampled" with resolution_mm and volume_error_estimate, and status
         "indeterminate" if an open mesh leaves the answer unknown.
         """
-        client = get_client(ctx)
+        client = await get_client(ctx)
         ra, rb = await asyncio.gather(
             _mesh(client, file_a, parameters_a, timeout), _mesh(client, file_b, parameters_b, timeout)
         )
@@ -231,7 +231,7 @@ def register_analysis_tools(mcp: MCPServer) -> None:
             fail("Intersection render failed", **failure_info(res.output, res.diagnostics))
         st = geometry.mesh_stats(geometry.read_stl(res.stl))  # type: ignore[arg-type]
         vol = abs(st.volume)
-        if st.triangles == 0 or vol < 1e-6:
+        if st.triangles == 0 or vol < geometry.VOLUME_FLOOR:
             return {**base, "status": "touching_or_near", "interference_volume": round(vol, 6)}
         d = st.to_dict()
         return {**base, "status": "interference", "interference_volume": round(vol, 4),
@@ -256,7 +256,7 @@ def register_analysis_tools(mcp: MCPServer) -> None:
         Use it to check wall thickness, bores and internal cavities.
         Plane coordinates: z-cut -> (x, y); y-cut -> (x, -z); x-cut -> (-z, y).
         """
-        client = get_client(ctx)
+        client = await get_client(ctx)
         axis = axis.lower()
         if axis not in ("x", "y", "z"):
             fail("axis must be x, y or z.")
@@ -274,8 +274,8 @@ def register_analysis_tools(mcp: MCPServer) -> None:
             meta["warning"] = ("The cut crosses open or non-manifold parts of the mesh (see openscad_measure "
                                "mesh_health); area and regions are approximate.")
         if cut["on_face"]:
-            meta["note"] = ("The plane lies on a face of the model: the section is taken just below it (just "
-                            "above where nothing is below). Offset it by 0.01 mm to choose a side.")
+            meta["note"] = ("The plane lies on a face of the model: each body is cut just below it, or just "
+                            "above it if the body stands on the plane. Offset it by 0.01 mm to choose a side.")
         content: list = []
         if return_image:
             png_name = f"{Path(filename).with_suffix('')}_section_{axis}{offset:g}.png"
@@ -305,7 +305,7 @@ def register_analysis_tools(mcp: MCPServer) -> None:
         fit in build_volume [x, y, z] mm (default 256^3), watertightness,
         separate bodies, and a list of issues.
         """
-        client = get_client(ctx)
+        client = await get_client(ctx)
         bv = tuple(build_volume or (256.0, 256.0, 256.0))
         if len(bv) != 3:
             fail("build_volume must be [x, y, z].")
@@ -328,7 +328,7 @@ def register_analysis_tools(mcp: MCPServer) -> None:
         expressions=["wall*2 + clearance", "len(holes)"], filename="box.scad".
         Values come back as OpenSCAD prints them (6 significant digits).
         """
-        client = get_client(ctx)
+        client = await get_client(ctx)
         if not expressions:
             fail("Pass at least one expression.")
         try:

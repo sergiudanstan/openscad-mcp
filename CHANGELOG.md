@@ -15,10 +15,11 @@ All notable changes to this project are documented here. The format follows
   get_info → section went from 145 s to 36 s; export and get_info after a measure take milliseconds.
 - `openscad_section` slices the cached mesh in Python instead of rendering `projection(cut=true)` of
   it with CGAL: 5.2 s → 0.02 s on `gear_train.scad` (0.2 s with the image). It agrees with the CGAL
-  result on manifold models (area within 1e-6, same regions) and adds a note when the plane lies on a face.
+  result on manifold models (area within 1e-6, same regions) and adds a note when the plane lies on a face
+  (each body is then cut just below the plane, or just above it if it stands on the plane).
 - Results are smaller: warnings repeated on many lines are merged (`lines: [...]`), the message text
-  no longer repeats file and line, echo is capped at 10 lines outside `openscad_check_syntax`
-  (`echo_omitted` gives the rest), console lines that are not errors, warnings or echo (DEPRECATED,
+  no longer repeats file and line, echo is capped at 10 lines outside `openscad_check_syntax` (the
+  first and last half are kept; `echo_omitted` counts the rest), console lines that are not errors, warnings or echo (DEPRECATED,
   EXPORT-WARNING) come once each as `notes`, and the raw console dump (`stderr`/`console`) is only
   returned when nothing in it could be parsed. On `gear_train.scad` a measure result went from
   4.7k to 0.8k characters, get_info from 7.7k to 0.75k.
@@ -39,16 +40,16 @@ All notable changes to this project are documented here. The format follows
   "touching_or_near" when CGAL refused to re-import a non-manifold mesh (for example gear teeth
   tangent to the body, three of the bundled examples). Sections now work on such meshes, and
   interference falls back to a ray-sampled estimate (`method: "ray_sampled"`, `resolution_mm`,
-  `volume_error_bound`; `indeterminate` when an open mesh leaves the answer unknown), also when CGAL
-  times out.
+  `volume_error_estimate`; `indeterminate` when an open mesh leaves the answer unknown), also when CGAL
+  times out. Overlaps under 5e-5 mm³ (faces in contact) count as touching on both paths.
 - A file saved just as a render finished could be cached with the new file's digest next to the
   old mesh, so the stale mesh was served until the next edit; the digest is now taken before the
   check for edits. A render that cannot be cached no longer replaces another process's entry.
 - The cache key now includes the library search path and ignores the order of parameters.
 - `openscad_preview(render=true)` always failed on OpenSCAD 2021.01: `--render` took the input file
   as its value.
-- Stopping the server with SIGTERM/SIGHUP left running OpenSCAD renders behind for minutes; they are
-  killed first. A workspace that cannot be created is reported by the tools instead of stopping the
+- Stopping a stdio server with SIGTERM/SIGHUP left running OpenSCAD renders behind for minutes; they
+  are killed first (over HTTP the web server's graceful shutdown runs, then leftover renders are killed). A workspace that cannot be created is reported by the tools instead of stopping the
   server. `openscad_eval` and 2D measurement no longer leak (or share) temporary files.
 
 ## [0.3.0] - 2026-11-25

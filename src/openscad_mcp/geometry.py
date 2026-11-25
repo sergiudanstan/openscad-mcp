@@ -366,7 +366,7 @@ def _cut_segments(tris: list[Tri], k: int, offset: float, to2d, on_plane_below: 
     where it leaves it, which makes outer loops counter-clockwise and holes
     clockwise in (u, v) for an outward-oriented mesh."""
     segs = []
-    for tri in tris:
+    for ti, tri in enumerate(tris):
         d = (tri[0][k] - offset, tri[1][k] - offset, tri[2][k] - offset)
         below = tuple((x <= 0) if on_plane_below else (x < 0) for x in d)
         if below[0] == below[1] == below[2]:
@@ -387,8 +387,34 @@ def _cut_segments(tris: list[Tri], k: int, offset: float, to2d, on_plane_below: 
             else:
                 leave = ((lo, hi), pt)
         if entry is not None and leave is not None:
-            segs.append((entry[0], leave[0], entry[1], leave[1]))
+            segs.append((entry[0], leave[0], entry[1], leave[1], ti))
     return segs
+
+
+def _components(tris: list[Tri]) -> list[int]:
+    """Connected body of each triangle (triangles sharing a vertex are one body)."""
+    index: dict[Vec, int] = {}
+    parent: list[int] = []
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    ids = []
+    for tri in tris:
+        tid = []
+        for v in tri:
+            if v not in index:
+                index[v] = len(parent)
+                parent.append(len(parent))
+            tid.append(index[v])
+        ids.append(tid)
+        r = find(tid[0])
+        for other in tid[1:]:
+            parent[find(other)] = r
+    return [find(t[0]) for t in ids]
 
 
 def section(tris: list[Tri], axis: str, offset: float) -> dict | None:
@@ -398,21 +424,28 @@ def section(tris: list[Tri], axis: str, offset: float) -> dict | None:
     Area is the shoelace sum over all segments (holes subtract; it does not
     depend on how segments are chained). Segments are chained into loops by
     the mesh edge they cross, never by comparing coordinates; `regions` counts
-    the counter-clockwise (outer) loops. A plane lying exactly on a face cuts
-    just below it, or just above it when nothing lies below (a bottom face), so
-    the face itself is reported either way.
+    the outer loops (those wound like the whole section, so an inside-out mesh
+    is counted right). A plane lying exactly on a face cuts each body just below
+    it, or just above it when that body has nothing below (a part standing on
+    the plane), so the face itself is reported either way.
     """
     k, to2d = _SECTION_AXES[axis]
     on_face = any(t[0][k] == offset and t[1][k] == offset and t[2][k] == offset for t in tris)
     segs = _cut_segments(tris, k, offset, to2d, on_plane_below=False)
-    if not segs:
-        segs = _cut_segments(tris, k, offset, to2d, on_plane_below=True)
+    if on_face or not segs:
+        above = _cut_segments(tris, k, offset, to2d, on_plane_below=True)
+        if not segs:
+            segs = above
+        elif above:
+            body = _components(tris)
+            cut_below = {body[s[4]] for s in segs}
+            segs += [s for s in above if body[s[4]] not in cut_below]
     if not segs:
         return None
     area2 = 0.0
     us: list[float] = []
     vs: list[float] = []
-    for _, _, (u0, v0), (u1, v1) in segs:
+    for _, _, (u0, v0), (u1, v1), _ in segs:
         area2 += u0 * v1 - u1 * v0
         us += (u0, u1)
         vs += (v0, v1)
@@ -446,7 +479,7 @@ def section(tris: list[Tri], axis: str, offset: float) -> dict | None:
         elif len(pts) >= 3:
             loop2 = sum(pts[i][0] * pts[(i + 1) % len(pts)][1] - pts[(i + 1) % len(pts)][0] * pts[i][1]
                         for i in range(len(pts)))
-            if loop2 / 2 > 1e-12 * scale * scale:
+            if loop2 * math.copysign(1.0, area2) / 2 > 1e-12 * scale * scale:  # wound like the outer boundary
                 regions += 1
         loops.append(pts)
     return {
@@ -462,6 +495,10 @@ def section(tris: list[Tri], axis: str, offset: float) -> dict | None:
         "loops": loops,
     }
 
+
+# Overlap volumes below this (mm^3) are float noise of faces in contact; it is
+# also the smallest volume that survives rounding to 4 decimals.
+VOLUME_FLOOR = 5e-5
 
 # Rays sit at an irrational fraction of each grid cell, so they never run
 # exactly along an edge shared by two triangles of an axis-aligned CAD face.
@@ -518,7 +555,10 @@ def ray_overlap(tris_a: list[Tri], tris_b: list[Tri], bbox_a: tuple[Vec, Vec], b
     on meshes CGAL refuses (non-manifold). Rays crossing a mesh an odd number of
     times (an open mesh) are dropped and counted in `invalid_rays`.
 
-    error_bound is a conservative bound on the volume error from sampling.
+    error_bound estimates the discretisation error from the overlap lengths of
+    neighbouring rays; a feature narrower than a cell that no ray hits is
+    outside it. Overlaps under VOLUME_FLOOR (face contact in float noise)
+    count as touching.
     """
     lo = [max(bbox_a[0][i], bbox_b[0][i]) for i in range(3)]
     hi = [min(bbox_a[1][i], bbox_b[1][i]) for i in range(3)]
@@ -576,7 +616,7 @@ def ray_overlap(tris_a: list[Tri], tris_b: list[Tri], bbox_a: tuple[Vec, Vec], b
             up = lengths[(j + 1) * nx + i] if j + 1 < ny else 0.0
             jump += abs(v - right) + abs(v - up) + (v if i == 0 else 0.0) + (v if j == 0 else 0.0)
     out: dict = {"volume": total * cell, "error_bound": jump * cell / 2, "cell": [hx, hy], "invalid_rays": invalid}
-    if total > 0:
+    if total * cell >= VOLUME_FLOOR:
         cols = [k for k in range(nx * ny) if lengths[k]]
         ii = [k % nx for k in cols]
         jj = [k // nx for k in cols]
@@ -587,7 +627,7 @@ def ray_overlap(tris_a: list[Tri], tris_b: list[Tri], bbox_a: tuple[Vec, Vec], b
             "bbox_max": (lo[0] + (max(ii) + 1) * hx, lo[1] + (max(jj) + 1) * hy, zhi),
         })
     else:
-        out["status"] = "indeterminate" if invalid else "touching_or_near"
+        out.update(volume=0.0, error_bound=0.0, status="indeterminate" if invalid else "touching_or_near")
     return out
 
 

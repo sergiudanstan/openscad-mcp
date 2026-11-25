@@ -68,7 +68,7 @@ def register_render_tools(mcp: MCPServer) -> None:
                 Strings that are numbers/vectors/booleans pass through as written.
             timeout: Seconds before the render is aborted (default OPENSCAD_MCP_TIMEOUT, 300).
         """
-        client = get_client(ctx)
+        client = await get_client(ctx)
         fmt = output_format.lower().lstrip(".")
         if fmt not in SUPPORTED_EXPORT_FORMATS:
             fail(f"Unsupported format '{fmt}'. Choose from: {', '.join(sorted(SUPPORTED_EXPORT_FORMATS))}")
@@ -141,7 +141,8 @@ def register_render_tools(mcp: MCPServer) -> None:
             filename: Path to the .scad file (relative to workspace).
             output_filename: PNG name for a single view (default <stem>_preview.png).
             width, height: Image size in pixels (max 2048 each). Default 1024x768
-                for one view, 512x384 per view when several are rendered.
+                for one view, 512x384 per view when several are rendered; give
+                one side and the other follows the 4:3 shape.
             camera: Explicit camera "tx,ty,tz,rx,ry,rz,dist" or "ex,ey,ez,cx,cy,cz" (single view).
             colorscheme: e.g. "Cornfield", "Metallic", "Tomorrow Night".
             projection: "p" (perspective) or "o" (orthographic).
@@ -151,10 +152,14 @@ def register_render_tools(mcp: MCPServer) -> None:
             show_edges, show_axes: Draw mesh edges / axes.
             return_image: Return the PNG data inline (set false to only write files).
         """
-        client = get_client(ctx)
+        client = await get_client(ctx)
         if not client.resolve_path(filename).is_file():
             fail(f"File not found: {filename}")
         default = MULTI_VIEW_SIZE if (views and len(views) > 1 and not camera) else SINGLE_VIEW_SIZE
+        if width and not height:  # one side given: keep the default 4:3 shape
+            height = int(width) * default[1] // default[0]
+        elif height and not width:
+            width = int(height) * default[0] // default[1]
         width = max(16, min(int(width or default[0]), MAX_IMAGE_SIDE))
         height = max(16, min(int(height or default[1]), MAX_IMAGE_SIDE))
         extra: list[str] = []
@@ -234,7 +239,7 @@ def register_render_tools(mcp: MCPServer) -> None:
             mp4: Encode the frames to MP4 with ffmpeg when available.
             fps: Frames per second of the MP4.
         """
-        client = get_client(ctx)
+        client = await get_client(ctx)
         if not client.resolve_path(filename).is_file():
             fail(f"File not found: {filename}")
         if not 1 <= num_frames <= MAX_FRAMES:
@@ -296,7 +301,7 @@ def register_render_tools(mcp: MCPServer) -> None:
 
         For exact sizes, volume and mesh health use openscad_measure.
         """
-        client = get_client(ctx)
+        client = await get_client(ctx)
         src = client.resolve_path(filename)
         if not src.is_file():
             fail(f"File not found: {filename}")
