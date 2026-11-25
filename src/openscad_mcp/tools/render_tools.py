@@ -217,8 +217,10 @@ def register_render_tools(mcp: MCPServer) -> None:
             output_prefix = f"{stem}_frame.png"
         prefix_path = client.resolve_path(output_prefix)
         frame_stem = prefix_path.with_suffix("").name
-        for old in prefix_path.parent.glob(f"{frame_stem}[0-9]*.png"):
-            old.unlink()
+        frame_re = re.compile(re.escape(frame_stem) + r"\d+")
+        for old in prefix_path.parent.glob(f"{frame_stem}*.png"):
+            if frame_re.fullmatch(old.stem):  # only earlier frames of this prefix
+                old.unlink()
         rc, stdout, stderr = await client.render_animated(
             scad_file=filename, output_prefix=output_prefix, num_frames=num_frames,
             imgsize=(max(16, min(width, MAX_IMAGE_SIDE)), max(16, min(height, MAX_IMAGE_SIDE))),
@@ -226,7 +228,7 @@ def register_render_tools(mcp: MCPServer) -> None:
         )
         frames = sorted(
             p for p in prefix_path.parent.glob(f"{frame_stem}*.png")
-            if re.fullmatch(re.escape(frame_stem) + r"\d+", p.stem)
+            if frame_re.fullmatch(p.stem)
         )
         if rc != 0 or not frames:
             fail(f"OpenSCAD animation failed (rc={rc})", stderr=console(stderr), **diag_summary(stderr + stdout))
@@ -271,6 +273,7 @@ def register_render_tools(mcp: MCPServer) -> None:
         if not client.resolve_path(filename).is_file():
             fail(f"File not found: {filename}")
         summary_filename = str(Path(filename).with_suffix("")) + "_summary.json"
+        client.resolve_path(summary_filename).unlink(missing_ok=True)  # never report a stale summary
         rc, stdout, stderr = await client.get_info(scad_file=filename, summary_file=summary_filename)
         summary_path = client.resolve_path(summary_filename)
         summary_contents = summary_path.read_text(errors="replace") if summary_path.exists() else None

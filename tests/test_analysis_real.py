@@ -113,7 +113,7 @@ class TestEngineering:
         rep = await tools("openscad_print_report")(filename="t.scad")
         assert rep["overhang_area_mm2"] == pytest.approx(96)  # cap underside minus the stem
         assert rep["bed_contact_area_mm2"] == pytest.approx(4)
-        flat = await tools("openscad_print_report")(filename="t.scad", overhang_deg=89.99)
+        flat = await tools("openscad_print_report")(filename="t.scad", overhang_deg=89.9)
         assert flat["overhang_area_mm2"] == pytest.approx(96)
         await make(tools, "block.scad", "cube(10);")
         ok = await tools("openscad_print_report")(filename="block.scad")

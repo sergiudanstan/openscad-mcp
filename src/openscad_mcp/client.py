@@ -9,9 +9,11 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -253,12 +255,15 @@ class OpenSCADClient:
             try:
                 stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
             except asyncio.TimeoutError:
-                proc.kill()
-                await proc.communicate()
+                await _kill(proc)
                 raise TimeoutError(
                     f"OpenSCAD timed out after {timeout:g}s. Simplify the model, lower $fn, "
                     "or pass a larger timeout (OPENSCAD_MCP_TIMEOUT sets the default)."
                 )
+            except BaseException:
+                # Cancelled request or client gone: never leave a render running.
+                await _kill(proc)
+                raise
 
         stdout = stdout_b.decode(errors="replace")
         stderr = stderr_b.decode(errors="replace")
@@ -358,39 +363,55 @@ class OpenSCADClient:
                 pass
 
         entry.mkdir(parents=True, exist_ok=True)
-        tmp_stl = entry / f"mesh.{os.getpid()}.{id(src)}.tmp.stl"
-        deps_file = entry / f"deps.{os.getpid()}.{id(src)}.mk"
+        tag = secrets.token_hex(6)
+        tmp_stl = entry / f"mesh.{tag}.tmp.stl"
+        deps_file = entry / f"deps.{tag}.mk"
         args = ["-o", str(tmp_stl), "-d", str(deps_file)]
         if self.features.export_format:
             args += ["--export-format", "binstl"]
         args += self.features.manifold_args + diagnostics.define_args(parameters) + extra + [str(src)]
-        rc, stdout, stderr = await self.run(args, timeout=timeout)
-        output = diagnostics.strip_noise(stderr + stdout)
-        diag = diagnostics.parse_output(stderr + stdout)
-        dimension = diag["stats"].get("dimension")
-        if "not a 3D object" in stderr:
-            dimension = 2
-        ok = rc == 0 and tmp_stl.is_file() and not diag["errors"]
-        if not ok:
+        started = time.time()
+        try:
+            rc, stdout, stderr = await self.run(args, timeout=timeout)
+            output = diagnostics.strip_noise(stderr + stdout)
+            diag = diagnostics.parse_output(stderr + stdout)
+            dimension = diag["stats"].get("dimension")
+            if "not a 3D object" in stderr:
+                dimension = 2
+            ok = rc == 0 and tmp_stl.is_file() and not diag["errors"]
+            if not ok:
+                return MeshResult(False, None, rc, output, diag, dimension=dimension)
+            deps = self._parse_deps(deps_file) or [str(src)]
+            # Not cacheable when the dependency list is incomplete (a missing
+            # include/use is only a warning and is absent from the -d output) or
+            # a dependency changed while OpenSCAD was reading it.
+            unresolved = any(
+                w["message"].startswith(("Can't open include file", "Can't open library"))
+                for w in diag["warnings"]
+            )
+            changed = any(_mtime(p) >= started for p in deps)
+            meta_file.unlink(missing_ok=True)
+            os.replace(tmp_stl, stl)
+            if not (unresolved or changed):
+                meta = {"deps": self._digest(deps), "output": output, "diagnostics": diag, "source": str(src)}
+                meta_file.write_text(json.dumps(meta))
+            return MeshResult(True, stl, rc, output, diag, cached=False, dimension=3)
+        finally:
             tmp_stl.unlink(missing_ok=True)
             deps_file.unlink(missing_ok=True)
-            return MeshResult(False, None, rc, output, diag, dimension=dimension)
-        deps = self._parse_deps(deps_file) or [str(src)]
-        deps_file.unlink(missing_ok=True)
-        os.replace(tmp_stl, stl)
-        meta = {"deps": self._digest(deps), "output": output, "diagnostics": diag, "source": str(src)}
-        meta_file.write_text(json.dumps(meta))
-        return MeshResult(True, stl, rc, output, diag, cached=False, dimension=3)
 
     def clear_cache(self) -> dict[str, Any]:
+        """Remove only what this server owns (mesh/ and scratch/) under cache_dir."""
         freed = 0
         files = 0
-        if self.cache_dir.is_dir():
-            for p in self.cache_dir.rglob("*"):
-                if p.is_file():
-                    freed += p.stat().st_size
-                    files += 1
-            shutil.rmtree(self.cache_dir, ignore_errors=True)
+        for sub in ("mesh", "scratch"):
+            d = self.cache_dir / sub
+            if d.is_dir() and not d.is_symlink():
+                for p in d.rglob("*"):
+                    if p.is_file():
+                        freed += p.stat().st_size
+                        files += 1
+                shutil.rmtree(d, ignore_errors=True)
         return {"files_removed": files, "bytes_freed": freed, "cache_dir": str(self.cache_dir)}
 
     def write_wrapper(self, code: str) -> Path:
@@ -487,11 +508,17 @@ class OpenSCADClient:
         lines = []
         if scad_file:
             src = self.resolve_path(scad_file)
+            if not src.is_file():
+                raise ValueError(f"File not found: {scad_file}")
+            if ">" in str(src):
+                raise ValueError("File path must not contain '>'")
             lines.append(f"include <{src}>")
+        # A per-call nonce keeps model output (or string values containing
+        # newlines) from impersonating a result line.
+        nonce = secrets.token_hex(4)
         for i, expr in enumerate(expressions):
-            if ";" in expr:
-                raise ValueError(f"Expression must not contain ';': {expr!r}")
-            lines.append(f"echo(__mcp_{i} = ({expr}));")
+            _check_expression(expr)
+            lines.append(f"echo(__mcp_{nonce}_{i} = ({expr}));")
         wrapper = self.write_wrapper("\n".join(lines) + "\n")
         with tempfile.TemporaryDirectory() as tmp:
             echo_file = Path(tmp) / "eval.echo"
@@ -499,9 +526,11 @@ class OpenSCADClient:
                 ["-o", str(echo_file), *diagnostics.define_args(parameters), str(wrapper)], timeout=60
             )
             text = (echo_file.read_text(errors="replace") if echo_file.exists() else "") + stderr
+        wrapper.unlink(missing_ok=True)
         values: dict[int, str] = {}
-        for m in re.finditer(r"^ECHO: __mcp_(\d+) = (.*)$", text, re.M):
-            values[int(m.group(1))] = m.group(2).strip()
+        for m in re.finditer(rf"^ECHO: __mcp_{nonce}_(\d+) = (.*)$", text, re.M):
+            values.setdefault(int(m.group(1)), m.group(2).strip())
+        text = re.sub(rf"__mcp_{nonce}_(\d+)", r"expr\1", text)
         results = []
         for i, expr in enumerate(expressions):
             raw = values.get(i)
@@ -554,6 +583,50 @@ class OpenSCADClient:
         parsed = diagnostics.parse_output(stderr)
         summary.write_text(json.dumps({"geometry": parsed["stats"]}, indent=2))
         return rc, stdout, stderr
+
+
+async def _kill(proc: asyncio.subprocess.Process) -> None:
+    if proc.returncode is None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        await proc.wait()
+
+
+def _mtime(path: str) -> float:
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return float("inf")  # vanished during the render: do not trust the result
+
+
+def _check_expression(expr: str) -> None:
+    """One self-contained expression: no statements, balanced brackets."""
+    if ";" in expr or "\n" in expr or "\r" in expr:
+        raise ValueError(f"Expression must be a single expression without ';' or newlines: {expr!r}")
+    depth = {"(": 0, "[": 0, "{": 0}
+    close = {")": "(", "]": "[", "}": "{"}
+    in_str = False
+    i = 0
+    while i < len(expr):
+        c = expr[i]
+        if in_str:
+            if c == "\\":
+                i += 1
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c in depth:
+            depth[c] += 1
+        elif c in close:
+            depth[close[c]] -= 1
+            if depth[close[c]] < 0:
+                raise ValueError(f"Unbalanced brackets in expression: {expr!r}")
+        i += 1
+    if in_str or any(depth.values()):
+        raise ValueError(f"Unbalanced brackets or quotes in expression: {expr!r}")
 
 
 def _value_type(raw: str | None) -> str:

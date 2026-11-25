@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 import re
 from typing import Any
@@ -102,15 +101,134 @@ def parse_output(text: str) -> dict[str, Any]:
 # Values -> OpenSCAD literals
 # ----------------------------------------------------------------------
 
-_RAW_LITERAL = re.compile(r"^\s*(-?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?|true|false|undef)\s*$")
+_NUM = re.compile(r"[-+]?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?")
+_UNESCAPE = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\"}
+
+
+class _LiteralParser:
+    """Parser for OpenSCAD literal values: numbers, true/false/undef, strings,
+    vectors (trailing comma allowed) and ranges [a:b] / [a:s:b]. Comments
+    between tokens are allowed. Anything else (expressions) is rejected."""
+
+    def __init__(self, text: str) -> None:
+        self.t = text
+        self.i = 0
+
+    def ws(self) -> None:
+        while True:
+            m = re.compile(r"\s+|//[^\n]*|/\*.*?\*/", re.S).match(self.t, self.i)
+            if not m or m.end() == self.i:
+                return
+            self.i = m.end()
+
+    def value(self) -> Any:
+        self.ws()
+        t, i = self.t, self.i
+        if t.startswith("[", i):
+            self.i += 1
+            items: list[Any] = []
+            self.ws()
+            if t.startswith("]", self.i):
+                self.i += 1
+                return items
+            first = self.value()
+            self.ws()
+            if t.startswith(":", self.i) and isinstance(first, (int, float)):
+                parts = [first]
+                while t.startswith(":", self.i):
+                    self.i += 1
+                    v = self.value()
+                    if not isinstance(v, (int, float)) or isinstance(v, bool):
+                        raise ValueError("range bounds must be numbers")
+                    parts.append(v)
+                    self.ws()
+                if len(parts) > 3 or not t.startswith("]", self.i):
+                    raise ValueError("bad range")
+                self.i += 1
+                return {"range": parts}
+            items.append(first)
+            while True:
+                self.ws()
+                if t.startswith("]", self.i):
+                    self.i += 1
+                    return items
+                if not t.startswith(",", self.i):
+                    raise ValueError("expected , or ]")
+                self.i += 1
+                self.ws()
+                if t.startswith("]", self.i):  # trailing comma
+                    self.i += 1
+                    return items
+                items.append(self.value())
+        if t.startswith('"', i):
+            out, j = [], i + 1
+            while j < len(t) and t[j] != '"':
+                if t[j] == "\\" and j + 1 < len(t):
+                    nxt = t[j + 1]
+                    if nxt in _UNESCAPE:
+                        out.append(_UNESCAPE[nxt])
+                        j += 2
+                        continue
+                    m = re.compile(r"x([0-7][0-9a-fA-F])|u([0-9a-fA-F]{4})|U([0-9a-fA-F]{6})").match(t, j + 1)
+                    if m:
+                        out.append(chr(int(next(g for g in m.groups() if g), 16)))
+                        j = m.end()
+                        continue
+                out.append(t[j])
+                j += 1
+            if j >= len(t):
+                raise ValueError("unterminated string")
+            self.i = j + 1
+            return "".join(out)
+        for word, val in (("true", True), ("false", False), ("undef", None)):
+            if t.startswith(word, i) and not re.match(r"\w", t[i + len(word): i + len(word) + 1]):
+                self.i = i + len(word)
+                return val
+        m = _NUM.match(t, i)
+        if m and not re.match(r"[\w.]", t[m.end(): m.end() + 1]):
+            self.i = m.end()
+            num = float(m.group(0))
+            return int(num) if re.fullmatch(r"[-+]?\d+", m.group(0)) else num
+        raise ValueError("not a literal")
+
+
+def parse_literal(text: str) -> Any:
+    """Parse an OpenSCAD literal; raises ValueError for anything else."""
+    p = _LiteralParser(text)
+    v = p.value()
+    p.ws()
+    if p.i != len(text):
+        raise ValueError("trailing text after literal")
+    return v
+
+
+def _scad_string(value: str) -> str:
+    out = []
+    for ch in value:
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == '"':
+            out.append('\\"')
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append(f"\\x{ord(ch):02x}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
 
 
 def to_literal(value: Any) -> str:
     """Serialise a Python/JSON value as an OpenSCAD literal for -D.
 
-    Strings that already are numbers, booleans, undef, vectors ("[...]") or
-    quoted strings pass through unchanged (keeps {"size": "10"} working);
-    any other string becomes an OpenSCAD string literal.
+    Strings that already are a complete OpenSCAD literal (number, boolean,
+    undef, vector, range or quoted string) pass through unchanged, which keeps
+    {"size": "10"} working; any other string becomes an OpenSCAD string, so a
+    value can never smuggle in statements.
     """
     if value is None:
         return "undef"
@@ -124,11 +242,13 @@ def to_literal(value: Any) -> str:
         return "[" + ", ".join(to_literal(v) for v in value) + "]"
     if isinstance(value, str):
         s = value.strip()
-        if _RAW_LITERAL.match(s) or (s.startswith("[") and s.endswith("]")) or (
-            len(s) >= 2 and s.startswith('"') and s.endswith('"')
-        ):
-            return s
-        return json.dumps(value)  # JSON string escaping matches OpenSCAD's
+        if s and ("//" not in s and "/*" not in s):
+            try:
+                parse_literal(s)
+                return s
+            except ValueError:
+                pass
+        return _scad_string(value)
     raise ValueError(f"Unsupported parameter type: {type(value).__name__}")
 
 
@@ -180,13 +300,24 @@ _DEF = re.compile(r"(?m)^[ \t]*(module|function)\b")
 
 
 def _parse_value(text: str) -> tuple[bool, Any]:
-    t = text.strip()
-    if t in ("true", "false"):
-        return True, t == "true"
     try:
-        return True, json.loads(t)  # numbers, strings, flat/nested vectors
-    except (json.JSONDecodeError, ValueError):
-        return False, t
+        return True, parse_literal(text.strip())
+    except ValueError:
+        return False, text.strip()
+
+
+def _type_name(value: Any) -> str:
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "vector"
+    if isinstance(value, dict):
+        return "range"
+    return "undef"
 
 
 def extract_parameters(src: str) -> list[dict[str, Any]]:
@@ -221,7 +352,7 @@ def extract_parameters(src: str) -> list[dict[str, Any]]:
         item: dict[str, Any] = {
             "name": name,
             "value": value,
-            "type": type(value).__name__ if not isinstance(value, list) else "vector",
+            "type": _type_name(value),
             "line": src.count("\n", 0, m.start()) + 1,
         }
         if group:

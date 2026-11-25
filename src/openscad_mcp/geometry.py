@@ -300,7 +300,9 @@ def print_report(
         return {"error": "Empty mesh."}
     zmin = st.bbox_min[2]
     tol = 1e-3
-    limit = math.sin(math.radians(overhang_deg))
+    # 0.01 deg of slack: float32 vertices put faces drawn exactly at the threshold
+    # (e.g. a 45 deg chamfer) a hair either side of it.
+    limit = math.sin(math.radians(min(90.0, overhang_deg + 0.01)))
     overhang_area = bed_area = 0.0
     overhang_facets = 0
     lowest_overhang: float | None = None

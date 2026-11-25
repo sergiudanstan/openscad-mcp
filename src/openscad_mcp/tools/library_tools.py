@@ -305,9 +305,12 @@ def register_library_tools(mcp: MCPServer) -> None:
         result: dict[str, Any] = {"name": fname, "content": code}
         if copy_to_workspace:
             dst = client.resolve_path(f"examples/{fname}")
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            dst.write_text(code, encoding="utf-8")
             result["workspace_file"] = f"examples/{fname}"
+            if dst.is_file() and dst.read_text(encoding="utf-8", errors="replace") != code:
+                result["note"] = "Workspace copy differs (edited?) and was left unchanged."
+            else:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.write_text(code, encoding="utf-8")
         return result
 
     @tool(mcp, annotations=READ_ONLY)
