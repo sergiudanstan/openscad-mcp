@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import shutil
 from pathlib import Path
@@ -12,7 +13,9 @@ from typing import Any
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.utilities.types import Image
 
-from openscad_mcp.tools._common import Params, WRITES_OUTPUT, console, diag_summary, fail, get_client, tool
+from openscad_mcp.tools._common import (
+    Params, WRITES_OUTPUT, compact_diag, diag_summary, fail, failure_info, get_client, tool,
+)
 
 SUPPORTED_EXPORT_FORMATS = {"stl", "3mf", "off", "amf", "dxf", "svg", "pdf", "csg", "png", "echo", "ast"}
 
@@ -30,6 +33,10 @@ VIEWS = {
 }
 MAX_IMAGE_SIDE = 2048
 MAX_FRAMES = 720
+# Image tokens grow with pixels (about w*h/750), so a multi-view call uses
+# smaller tiles unless a size is given: four 512x384 views cost one 1024x768.
+SINGLE_VIEW_SIZE = (1024, 768)
+MULTI_VIEW_SIZE = (512, 384)
 
 
 def _png_size(path: Path) -> tuple[int, int] | None:
@@ -61,7 +68,7 @@ def register_render_tools(mcp: MCPServer) -> None:
                 Strings that are numbers/vectors/booleans pass through as written.
             timeout: Seconds before the render is aborted (default OPENSCAD_MCP_TIMEOUT, 300).
         """
-        client = get_client(ctx)
+        client = await get_client(ctx)
         fmt = output_format.lower().lstrip(".")
         if fmt not in SUPPORTED_EXPORT_FORMATS:
             fail(f"Unsupported format '{fmt}'. Choose from: {', '.join(sorted(SUPPORTED_EXPORT_FORMATS))}")
@@ -70,17 +77,33 @@ def register_render_tools(mcp: MCPServer) -> None:
         src = client.resolve_path(filename)
         if not src.is_file():
             fail(f"File not found: {filename}")
-        try:
-            rc, stdout, stderr = await client.export(
-                scad_file=filename, output_file=output_filename, parameters=parameters, timeout=timeout
-            )
-        except ValueError as exc:
-            fail(str(exc))
         out = client.resolve_path(output_filename)
-        diag = diag_summary(stderr + stdout)
-        if rc != 0 or not out.is_file() or diag.get("errors"):
-            fail(f"OpenSCAD export failed (rc={rc})", stderr=console(stderr), **diag)
+        cached = None
+        if fmt == "stl":
+            # The mesh cache holds exactly this file (same binary STL export), so a
+            # model already measured or analysed is copied instead of re-rendered.
+            res = await client.render_mesh(src, parameters=parameters, timeout=timeout)
+            if not res.ok or res.stl is None:
+                fail(f"OpenSCAD export failed (rc={res.returncode})", **failure_info(res.output, res.diagnostics))
+            diag = compact_diag(res.diagnostics)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            tmp = out.with_name(f".{out.name}.{os.getpid()}.tmp")
+            shutil.copyfile(res.stl, tmp)
+            os.replace(tmp, out)
+            cached = res.cached
+        else:
+            try:
+                rc, stdout, stderr = await client.export(
+                    scad_file=filename, output_file=output_filename, parameters=parameters, timeout=timeout
+                )
+            except ValueError as exc:
+                fail(str(exc))
+            diag = diag_summary(stderr + stdout)
+            if rc != 0 or not out.is_file() or diag.get("errors"):
+                fail(f"OpenSCAD export failed (rc={rc})", **failure_info(stderr + stdout))
         result: dict[str, Any] = {"path": str(out), "format": fmt, "bytes": out.stat().st_size, **diag}
+        if cached is not None:
+            result["cached"] = cached
         if fmt == "stl":
             from openscad_mcp import geometry
 
@@ -93,8 +116,8 @@ def register_render_tools(mcp: MCPServer) -> None:
         ctx: Context,
         filename: str,
         output_filename: str | None = None,
-        width: int = 1024,
-        height: int = 768,
+        width: int | None = None,
+        height: int | None = None,
         camera: str | None = None,
         colorscheme: str | None = None,
         projection: str | None = None,
@@ -111,12 +134,15 @@ def register_render_tools(mcp: MCPServer) -> None:
         One call can render several standard views in parallel:
         views=["isometric","front","top","right"] (also back, left, bottom, dimetric).
         OpenSCAD draws an empty scene and exits 0 when an assert fails or a
-        module is unknown, so read the errors/warnings that follow the image.
+        module is unknown, so read the errors/warnings that follow the image;
+        when OpenSCAD reports errors the images are written but not returned.
 
         Args:
             filename: Path to the .scad file (relative to workspace).
             output_filename: PNG name for a single view (default <stem>_preview.png).
-            width, height: Image size in pixels (max 2048 each).
+            width, height: Image size in pixels (max 2048 each). Default 1024x768
+                for one view, 512x384 per view when several are rendered; give
+                one side and the other follows the 4:3 shape.
             camera: Explicit camera "tx,ty,tz,rx,ry,rz,dist" or "ex,ey,ez,cx,cy,cz" (single view).
             colorscheme: e.g. "Cornfield", "Metallic", "Tomorrow Night".
             projection: "p" (perspective) or "o" (orthographic).
@@ -126,11 +152,16 @@ def register_render_tools(mcp: MCPServer) -> None:
             show_edges, show_axes: Draw mesh edges / axes.
             return_image: Return the PNG data inline (set false to only write files).
         """
-        client = get_client(ctx)
+        client = await get_client(ctx)
         if not client.resolve_path(filename).is_file():
             fail(f"File not found: {filename}")
-        width = max(16, min(int(width), MAX_IMAGE_SIDE))
-        height = max(16, min(int(height), MAX_IMAGE_SIDE))
+        default = MULTI_VIEW_SIZE if (views and len(views) > 1 and not camera) else SINGLE_VIEW_SIZE
+        if width and not height:  # one side given: keep the default 4:3 shape
+            height = int(width) * default[1] // default[0]
+        elif height and not width:
+            width = int(height) * default[0] // default[1]
+        width = max(16, min(int(width or default[0]), MAX_IMAGE_SIDE))
+        height = max(16, min(int(height or default[1]), MAX_IMAGE_SIDE))
         extra: list[str] = []
         if render:
             extra += ["--render"] + client.features.manifold_args
@@ -165,19 +196,20 @@ def register_render_tools(mcp: MCPServer) -> None:
             fail(str(exc))
         content: list = []
         meta: dict[str, Any] = {"images": []}
-        all_text = ""
+        images: list = []
         for label, out_name, rc, stdout, stderr in results:
             out = client.resolve_path(out_name)
-            all_text += stderr + stdout
             if rc != 0 or not out.is_file():
-                fail(f"OpenSCAD preview failed (rc={rc}) for view '{label}'", stderr=console(stderr),
-                     **diag_summary(stderr + stdout))
+                fail(f"OpenSCAD preview failed (rc={rc}) for view '{label}'", **failure_info(stderr + stdout))
             meta["images"].append({"view": label, "path": str(out), "size": _png_size(out)})
-            if return_image:
-                content.append(Image(path=out))
-        meta.update(diag_summary(all_text))
+            images.append(Image(path=out))
+        # Every view evaluates the same model: report its messages once.
+        meta.update(diag_summary(results[0][4] + results[0][3]))
         if meta.get("errors"):
-            meta["note"] = "Errors were reported; the image may be empty or incomplete."
+            # The scene is empty or partial: images would only cost tokens.
+            meta["note"] = "OpenSCAD reported errors, so the images were written but not returned; fix the errors first."
+        elif return_image:
+            content.extend(images)
         content.append(json.dumps(meta))
         return content
 
@@ -207,7 +239,7 @@ def register_render_tools(mcp: MCPServer) -> None:
             mp4: Encode the frames to MP4 with ffmpeg when available.
             fps: Frames per second of the MP4.
         """
-        client = get_client(ctx)
+        client = await get_client(ctx)
         if not client.resolve_path(filename).is_file():
             fail(f"File not found: {filename}")
         if not 1 <= num_frames <= MAX_FRAMES:
@@ -231,7 +263,7 @@ def register_render_tools(mcp: MCPServer) -> None:
             if frame_re.fullmatch(p.stem)
         )
         if rc != 0 or not frames:
-            fail(f"OpenSCAD animation failed (rc={rc})", stderr=console(stderr), **diag_summary(stderr + stdout))
+            fail(f"OpenSCAD animation failed (rc={rc})", **failure_info(stderr + stdout))
         result: dict[str, Any] = {
             "output_prefix": output_prefix,
             "num_frames": num_frames,
@@ -269,23 +301,20 @@ def register_render_tools(mcp: MCPServer) -> None:
 
         For exact sizes, volume and mesh health use openscad_measure.
         """
-        client = get_client(ctx)
-        if not client.resolve_path(filename).is_file():
+        client = await get_client(ctx)
+        src = client.resolve_path(filename)
+        if not src.is_file():
             fail(f"File not found: {filename}")
-        summary_filename = str(Path(filename).with_suffix("")) + "_summary.json"
-        client.resolve_path(summary_filename).unlink(missing_ok=True)  # never report a stale summary
-        rc, stdout, stderr = await client.get_info(scad_file=filename, summary_file=summary_filename)
-        summary_path = client.resolve_path(summary_filename)
-        summary_contents = summary_path.read_text(errors="replace") if summary_path.exists() else None
-        if rc != 0 and summary_contents is None:
-            fail(f"OpenSCAD info failed (rc={rc})", stderr=console(stderr), **diag_summary(stderr + stdout))
-        result: dict[str, Any] = {"summary_file": str(summary_path), "backend": client.features.backend}
-        if summary_contents:
-            try:
-                result["summary"] = json.loads(summary_contents)
-            except json.JSONDecodeError:
-                result["summary_raw"] = summary_contents
-        result.update(diag_summary(stderr + stdout))
-        if console(stderr):
-            result["stderr"] = console(stderr)
+        summary_path = client.resolve_path(str(Path(filename).with_suffix("")) + "_summary.json")
+        summary_path.unlink(missing_ok=True)  # never report a stale summary
+        # Served from the mesh cache: OpenSCAD's --summary-file JSON when the
+        # binary writes one (2023+), else the statistics it printed while rendering.
+        res = await client.render_mesh(src)
+        if not res.ok:
+            fail(f"OpenSCAD info failed (rc={res.returncode})", **failure_info(res.output, res.diagnostics))
+        summary = res.summary or {"geometry": res.diagnostics.get("stats", {})}
+        summary_path.write_text(json.dumps(summary, indent=2))
+        result: dict[str, Any] = {"summary_file": str(summary_path), "backend": client.features.backend,
+                                  "summary": summary, "cached": res.cached}
+        result.update(compact_diag(res.diagnostics))
         return result

@@ -37,7 +37,7 @@ def register_design_tools(mcp: MCPServer) -> None:
 
         Paths are relative to the workspace; subfolders are created as needed.
         """
-        client = get_client(ctx)
+        client = await get_client(ctx)
         path = client.resolve_path(filename)
         existed = path.exists()
         _atomic_write(path, code)
@@ -55,7 +55,7 @@ def register_design_tools(mcp: MCPServer) -> None:
             filename: Path relative to the workspace.
             with_line_numbers: Prefix each line with its number (matches error line numbers).
         """
-        client = get_client(ctx)
+        client = await get_client(ctx)
         path = client.resolve_path(filename)
         if not path.is_file():
             fail(f"File not found: {filename}")
@@ -81,7 +81,7 @@ def register_design_tools(mcp: MCPServer) -> None:
         replace_all is true. Pass `expected_etag` (from read/create) to refuse
         the edit if the file changed since you last saw it.
         """
-        client = get_client(ctx)
+        client = await get_client(ctx)
         path = client.resolve_path(filename)
         if not path.is_file():
             fail(f"File not found: {filename}. Use openscad_create to create new files.")
@@ -116,7 +116,7 @@ def register_design_tools(mcp: MCPServer) -> None:
         descriptions and `/* [Group] */` headings. Override any of them with the
         `parameters` argument of preview/export/measure tools.
         """
-        client = get_client(ctx)
+        client = await get_client(ctx)
         path = client.resolve_path(filename)
         if not path.is_file():
             fail(f"File not found: {filename}")

@@ -1,5 +1,9 @@
 """OpenSCAD MCP Server."""
+import asyncio
 import logging
+import os
+import signal
+import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -18,8 +22,9 @@ INSTRUCTIONS = """\
 OpenSCAD modelling server (units: mm, Z up). All paths are relative to the workspace.
 
 Loop that works: openscad_create -> openscad_check_syntax -> openscad_preview
-(returns images; use views=["isometric","front","top","right"]) -> openscad_measure
-(exact bbox/volume/watertight) -> fix with openscad_edit (old_string/new_string) ->
+(returns images; views=["isometric","front","top","right"] gives 512x384 tiles,
+one view at full size shows detail) -> openscad_measure (exact
+bbox/volume/watertight) -> fix with openscad_edit (old_string/new_string) ->
 openscad_export. Judge sizes with openscad_measure, not by eye.
 
 - OpenSCAD exits 0 on failed asserts and unknown modules: always read `errors`
@@ -29,24 +34,66 @@ openscad_export. Judge sizes with openscad_measure, not by eye.
 - Engineering: openscad_mass_properties (material/density), openscad_interference
   (two parts), openscad_section (cut plane, wall thickness), openscad_print_report
   (overhangs, bed contact, build volume), openscad_eval (expressions in model scope).
-- Renders are cached by file content and includes; repeated analysis is fast.
+- One cached render per model and parameters serves measure, analysis, STL export and get_info.
 - Overlap coplanar faces in difference()/union() by 0.01 mm to stay manifold.
 """
+
+
+def _prepare(client: OpenSCADClient) -> None:
+    try:
+        client.ensure_ready()
+        logger.info("OpenSCAD MCP %s starting — binary: %s (%s, backend %s)", __version__,
+                    client.binary, client.features.version_text, client.features.backend)
+    except OSError as exc:  # includes FileNotFoundError for a missing binary
+        # Keep serving: tools report the problem instead of the server dying silently.
+        logger.error("%s", exc)
+    try:
+        client.evict()  # bring a cache left over the size cap back under it
+    except OSError:
+        logger.debug("Cache sweep at start failed", exc_info=True)
+
+
+def _install_terminate_handlers(client: OpenSCADClient) -> list[signal.Signals]:
+    """On SIGTERM/SIGHUP (a host quitting or restarting a stdio server) kill
+    running OpenSCAD processes first; otherwise they outlive the server for
+    minutes. Over HTTP the web server's own graceful shutdown is left alone:
+    the lifespan exit kills what is still running."""
+    if os.environ.get("MCP_TRANSPORT", "stdio").lower() != "stdio":
+        return []
+    loop = asyncio.get_running_loop()
+
+    def terminate(sig: signal.Signals) -> None:
+        client.kill_children()
+        signal.signal(sig, signal.SIG_DFL)
+        os.kill(os.getpid(), sig)
+
+    installed = []
+    for sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGHUP", None)):
+        if sig is None:
+            continue
+        try:
+            loop.add_signal_handler(sig, terminate, sig)
+            installed.append(sig)
+        except (NotImplementedError, RuntimeError, ValueError):
+            pass  # Windows, or not the main thread
+    return installed
 
 
 @asynccontextmanager
 async def server_lifespan(server: MCPServer) -> AsyncIterator[dict]:
     client = OpenSCADClient()
-    try:
-        client.ensure_ready()
-        logger.info("OpenSCAD MCP %s starting — binary: %s (%s, backend %s)", __version__,
-                    client.binary, client.features.version_text, client.features.backend)
-    except FileNotFoundError as exc:
-        # Keep serving: tools report the problem instead of the server dying silently.
-        logger.error("%s", exc)
+    # Probe the binary in a daemon thread: the initialize reply does not wait
+    # for it, a tool call that arrives first waits for it without blocking the
+    # event loop, and shutdown never waits for a hung binary.
+    threading.Thread(target=_prepare, args=(client,), name="openscad-probe", daemon=True).start()
+    handlers = _install_terminate_handlers(client)
     try:
         yield {"client": client}
     finally:
+        loop = asyncio.get_running_loop()
+        for sig in handlers:
+            loop.remove_signal_handler(sig)
+        client.kill_children()
         logger.info("OpenSCAD MCP server stopped")
 
 

@@ -32,10 +32,19 @@ Connect this server to Claude Desktop or Claude Code and you can ask Claude to:
   which OpenSCAD itself exits 0 on
 - **Export** to STL (binary), 3MF, OFF, AMF, DXF, SVG, PDF, CSG; **animate** `$t` to PNG frames + MP4
 
-Renders are cached by the content of the file **and everything it includes or imports**, so repeated
-measurements of a model are milliseconds instead of a full CGAL render (on the bundled
-`factory_arduino_assembly.scad`: 138 s first render, 0.12 s afterwards). With an OpenSCAD build that has
-the Manifold backend, the server uses it automatically.
+Each model is rendered once per parameter set: the mesh is cached by the content of the file **and
+everything it includes or imports**, and measure, mass, print report, section, interference, STL export
+and render statistics all reuse it. Parallel calls for the same model share one render. On the bundled
+`gear_train.scad` with OpenSCAD 2021.01 (CGAL), measure → export STL → get_info → section took 145 s in
+v0.3 (every step re-rendered) and takes 36 s now, all of it the first render. With an OpenSCAD build that
+has the Manifold backend, the server uses it automatically.
+
+A model whose `include`/`use` cannot be found is not cached (its dependency list is incomplete), so
+each call renders it again until the file is found; the result's warnings say which file is missing.
+
+Results are kept small for the model reading them: repeated warnings are merged into one entry with a
+line list, echo output is capped at 10 lines (200 in `openscad_check_syntax`; the first and last half
+are kept), and multi-view previews use 512×384 tiles unless a size is given.
 
 ## Available Tools
 
@@ -50,12 +59,12 @@ the Manifold backend, the server uses it automatically.
 | `openscad_preview` | PNG preview(s) returned as images; `views=["isometric","front","top","right",…]` |
 | `openscad_measure` | Exact bbox, volume, area, centroid, watertight, bodies (2D: area, perimeter) |
 | `openscad_mass_properties` | Mass, centre of mass, inertia tensor and principal moments for a material/density |
-| `openscad_interference` | Overlap volume/bbox between two parts, or clear / touching |
-| `openscad_section` | Cut at `axis=offset`: section area, 2D bbox, regions and an image |
+| `openscad_interference` | Overlap volume/bbox between two parts, or clear / touching; ray-sampled estimate when CGAL cannot intersect them |
+| `openscad_section` | Cut at `axis=offset`: section area, 2D bbox, regions and an image (sliced in Python, works on non-manifold meshes) |
 | `openscad_print_report` | Overhang area, bed contact, build-volume fit, issues list |
 | `openscad_export` | Export to STL, 3MF, OFF, AMF, DXF, SVG, PDF, CSG, ECHO, AST, PNG |
 | `openscad_render_animated` | Frames from `$t`, joined into an MP4 when ffmpeg is available |
-| `openscad_get_info` | Render statistics |
+| `openscad_get_info` | Render statistics (from the cached render) |
 | `openscad_list_files` | `.scad` files in the workspace (relative paths, libraries skipped) |
 | `openscad_list_examples` / `openscad_get_example` | Bundled examples; copy one into the workspace |
 | `openscad_list_libraries` / `openscad_library_info` | Installed libraries (incl. bundled MCAD) |
@@ -113,8 +122,12 @@ Restart Claude Desktop — the OpenSCAD tools will appear in the hammer icon.
 ```bash
 claude mcp add openscad -s user -- /full/path/to/openscad-mcp/.venv/bin/python -m openscad_mcp
 # or, without a clone (the PyPI name `openscad-mcp` belongs to a different project):
-claude mcp add openscad -s user -- uvx --from git+https://github.com/sergiudanstan/openscad-mcp openscad-mcp
+uv tool install git+https://github.com/sergiudanstan/openscad-mcp
+claude mcp add openscad -s user -- ~/.local/bin/openscad-mcp     # update later: uv tool upgrade openscad-mcp
 ```
+
+`uvx --from git+https://github.com/sergiudanstan/openscad-mcp openscad-mcp` also works, but it asks
+GitHub for the latest commit on every start (about 0.5 s slower) and the server does not start offline.
 
 Start a new Claude Code session and the `openscad_*` tools will be available.
 
@@ -158,6 +171,7 @@ openscad-mcp/
 | `OPENSCAD_MCP_WORKSPACE` | `~/openscad-mcp-workspace` | Where files are created; all paths are confined to it |
 | `OPENSCAD_MCP_LIBRARIES` | `~/Documents/OpenSCAD/libraries` | Extra libraries, put on `OPENSCADPATH` |
 | `OPENSCAD_MCP_CACHE` | `~/.cache/openscad_mcp_render` | Mesh cache |
+| `OPENSCAD_MCP_CACHE_MAX_MB` | `512` | Cache size cap; least recently used meshes go first |
 | `OPENSCAD_MCP_TIMEOUT` | `300` | Default render timeout in seconds (tools also take `timeout`) |
 | `OPENSCAD_MCP_JOBS` | CPUs − 1 | Maximum concurrent OpenSCAD processes |
 | `OPENSCAD_MCP_BACKEND` | auto | Set `cgal` to disable Manifold on builds that have it |

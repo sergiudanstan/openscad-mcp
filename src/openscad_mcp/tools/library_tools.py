@@ -9,10 +9,14 @@ from typing import Any
 from mcp.server.mcpserver import Context, MCPServer
 
 from openscad_mcp import diagnostics
-from openscad_mcp.tools._common import OVERWRITES, Params, READ_ONLY, WRITES_OUTPUT, fail, get_client, tool
+from openscad_mcp.tools._common import (
+    OVERWRITES, Params, READ_ONLY, WRITES_OUTPUT, compact_diag, fail, get_client, tool,
+)
 
 # Examples ship inside the package so they exist in wheel installs too.
 _EXAMPLES_DIR = Path(__file__).resolve().parent.parent / "examples"
+# Larger examples are copied to the workspace but not inlined (the biggest is ~28k tokens).
+INLINE_EXAMPLE_CHARS = 4000
 
 # Library descriptions for all 25 official OpenSCAD libraries + MCAD
 _LIBRARY_INFO = {
@@ -224,7 +228,7 @@ def register_library_tools(mcp: MCPServer) -> None:
 
         Symlinked library folders are skipped. `pattern` filters by substring.
         """
-        client = get_client(ctx)
+        client = await get_client(ctx)
         root = client.workspace.resolve()
         files = []
         for p in _workspace_scad_files(root):
@@ -243,7 +247,7 @@ def register_library_tools(mcp: MCPServer) -> None:
     @tool(mcp, annotations=READ_ONLY)
     async def openscad_version(ctx: Context) -> dict[str, Any]:
         """Get the installed OpenSCAD version, binary, geometry backend and paths."""
-        client = get_client(ctx)
+        client = await get_client(ctx)
         version_text = await client.version()
         return {
             "version": version_text,
@@ -262,9 +266,10 @@ def register_library_tools(mcp: MCPServer) -> None:
         `passed` is false whenever OpenSCAD reports an ERROR (parse errors,
         failed asserts), whatever its exit code; `strict_passed` additionally
         requires no warnings (unknown modules/variables are only warnings).
-        Each error/warning carries file and line when OpenSCAD gives them.
+        Each error/warning carries file and line (`lines` when one message
+        repeats); other console output such as DEPRECATED comes as `notes`.
         """
-        client = get_client(ctx)
+        client = await get_client(ctx)
         if not client.resolve_path(filename).is_file():
             fail(f"File not found: {filename}")
         try:
@@ -278,10 +283,9 @@ def register_library_tools(mcp: MCPServer) -> None:
             "passed": passed,
             "strict_passed": passed and not d["warnings"],
             "returncode": rc,
-            "errors": d["errors"][:100],
-            "warnings": d["warnings"][:100],
-            "echo": d["echo"][:200],
-            "stderr": diagnostics.truncate(diagnostics.strip_noise(stderr).strip()),
+            "errors": [],
+            "warnings": [],
+            **compact_diag(d, echo_lines=200, max_items=100),
         }
 
     @tool(mcp, annotations=READ_ONLY)
@@ -293,16 +297,24 @@ def register_library_tools(mcp: MCPServer) -> None:
         return {"examples": examples, "count": len(examples), "directory": str(_EXAMPLES_DIR)}
 
     @tool(mcp, annotations=WRITES_OUTPUT)
-    async def openscad_get_example(ctx: Context, name: str, copy_to_workspace: bool = True) -> dict[str, Any]:
-        """Return a built-in example's source; by default also copy it into the
-        workspace (examples/<name>) so the render tools can use it."""
-        client = get_client(ctx)
+    async def openscad_get_example(
+        ctx: Context, name: str, copy_to_workspace: bool = True, include_content: bool | None = None
+    ) -> dict[str, Any]:
+        """Copy a built-in example into the workspace (examples/<name>) so the
+        render tools can use it, and return its source. Sources over 4000
+        characters are not inlined when copied (read them with openscad_read);
+        include_content=true forces the source, false omits it."""
+        client = await get_client(ctx)
         fname = name if name.endswith(".scad") else f"{name}.scad"
         src = (_EXAMPLES_DIR / fname).resolve()
         if src.parent != _EXAMPLES_DIR.resolve() or not src.is_file():
             fail(f"Example not found: {name}", available=sorted(p.name for p in _EXAMPLES_DIR.glob("*.scad")))
         code = src.read_text(encoding="utf-8")
-        result: dict[str, Any] = {"name": fname, "content": code}
+        result: dict[str, Any] = {"name": fname, "bytes": len(code.encode("utf-8")), "lines": len(code.splitlines())}
+        inline = include_content if include_content is not None else (
+            not copy_to_workspace or len(code) <= INLINE_EXAMPLE_CHARS)
+        if inline:
+            result["content"] = code
         if copy_to_workspace:
             dst = client.resolve_path(f"examples/{fname}")
             result["workspace_file"] = f"examples/{fname}"
@@ -311,6 +323,9 @@ def register_library_tools(mcp: MCPServer) -> None:
             else:
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 dst.write_text(code, encoding="utf-8")
+            if not inline:
+                hint = f"Source not inlined; read it with openscad_read(\"examples/{fname}\") or pass include_content=true."
+                result["note"] = f"{result['note']} {hint}" if "note" in result else hint
         return result
 
     @tool(mcp, annotations=READ_ONLY)
@@ -321,7 +336,7 @@ def register_library_tools(mcp: MCPServer) -> None:
           use <LibraryName/module.scad>
           include <LibraryName/module.scad>
         """
-        client = get_client(ctx)
+        client = await get_client(ctx)
         libs = []
         if client.libraries.is_dir():
             for lib_dir in sorted(client.libraries.iterdir()):
@@ -345,7 +360,7 @@ def register_library_tools(mcp: MCPServer) -> None:
         Args:
             library_name: Name of the library (e.g. "BOSL2", "NopSCADlib", "MCAD").
         """
-        client = get_client(ctx)
+        client = await get_client(ctx)
         lib_dir = None
         # A library is a direct child of a libraries directory (it may itself be a symlink).
         if Path(library_name).name == library_name and library_name not in ("", ".", ".."):
@@ -381,5 +396,5 @@ def register_library_tools(mcp: MCPServer) -> None:
     @tool(mcp, annotations=OVERWRITES)
     async def openscad_clear_cache(ctx: Context) -> dict[str, Any]:
         """Delete cached meshes and generated scratch files; reports space freed."""
-        client = get_client(ctx)
+        client = await get_client(ctx)
         return client.clear_cache()

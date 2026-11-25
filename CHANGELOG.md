@@ -6,6 +6,52 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-26
+
+### Changed
+- One render per model and parameter set: `openscad_export` (STL) and `openscad_get_info` reuse the
+  mesh cache instead of rendering again, and parallel calls for the same model share one render
+  (cancelling every caller stops it). On `gear_train.scad` (OpenSCAD 2021.01, CGAL) measure → export →
+  get_info → section went from 145 s to 36 s; export and get_info after a measure take milliseconds.
+- `openscad_section` slices the cached mesh in Python instead of rendering `projection(cut=true)` of
+  it with CGAL: 5.2 s → 0.02 s on `gear_train.scad` (0.2 s with the image). It agrees with the CGAL
+  result on manifold models (area within 1e-6, same regions) and adds a note when the plane lies on a face
+  (each body is then cut just below the plane, or just above it if it stands on the plane).
+- Results are smaller: warnings repeated on many lines are merged (`lines: [...]`), the message text
+  no longer repeats file and line, echo is capped at 10 lines outside `openscad_check_syntax` (the
+  first and last half are kept; `echo_omitted` counts the rest), console lines that are not errors, warnings or echo (DEPRECATED,
+  EXPORT-WARNING) come once each as `notes`, and the raw console dump (`stderr`/`console`) is only
+  returned when nothing in it could be parsed. On `gear_train.scad` a measure result went from
+  4.7k to 0.8k characters, get_info from 7.7k to 0.75k.
+- `openscad_preview`: views of a multi-view call default to 512×384 (four cost what one 1024×768
+  did); a single view stays 1024×768. When OpenSCAD reports errors the images are written but not
+  returned (the scene is empty), and messages are reported once instead of once per view.
+- `openscad_get_example` copies large examples into the workspace without inlining their source
+  (the biggest was about 28k tokens); `include_content` forces either way. Results give `bytes` and `lines`.
+- The server answers `initialize` without waiting for the OpenSCAD probe, which now runs `--version`
+  and `--help` at once; a binary that does not answer is probed again later instead of being treated
+  as featureless for the whole session.
+- Mesh cache entries name their own immutable STL (`mesh.<tag>.stl`), and the cache is capped
+  (`OPENSCAD_MCP_CACHE_MAX_MB`, default 512) with least-recently-used eviction; meshes no entry uses,
+  leftovers of interrupted renders and scratch files unused for a day are swept.
+
+### Fixed
+- `openscad_section` and `openscad_interference` reported "the plane does not cut the model" and
+  "touching_or_near" when CGAL refused to re-import a non-manifold mesh (for example gear teeth
+  tangent to the body, three of the bundled examples). Sections now work on such meshes, and
+  interference falls back to a ray-sampled estimate (`method: "ray_sampled"`, `resolution_mm`,
+  `volume_error_estimate`; `indeterminate` when an open mesh leaves the answer unknown), also when CGAL
+  times out. Overlaps under 5e-5 mm³ (faces in contact) count as touching on both paths.
+- A file saved just as a render finished could be cached with the new file's digest next to the
+  old mesh, so the stale mesh was served until the next edit; the digest is now taken before the
+  check for edits. A render that cannot be cached no longer replaces another process's entry.
+- The cache key now includes the library search path and ignores the order of parameters.
+- `openscad_preview(render=true)` always failed on OpenSCAD 2021.01: `--render` took the input file
+  as its value.
+- Stopping a stdio server with SIGTERM/SIGHUP left running OpenSCAD renders behind for minutes; they
+  are killed first (over HTTP the web server's graceful shutdown runs, then leftover renders are killed). A workspace that cannot be created is reported by the tools instead of stopping the
+  server. `openscad_eval` and 2D measurement no longer leak (or share) temporary files.
+
 ## [0.3.0] - 2026-11-25
 
 ### Added

@@ -1,3 +1,3 @@
 """OpenSCAD MCP Server — design, render, measure and export 3D models via OpenSCAD CLI."""
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

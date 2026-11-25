@@ -13,7 +13,9 @@ import secrets
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -32,6 +34,9 @@ DEFAULT_WORKSPACE = _env_path("OPENSCAD_MCP_WORKSPACE", Path.home() / "openscad-
 DEFAULT_LIBRARIES = _env_path("OPENSCAD_MCP_LIBRARIES", Path.home() / "Documents" / "OpenSCAD" / "libraries")
 DEFAULT_CACHE = _env_path("OPENSCAD_MCP_CACHE", Path.home() / ".cache" / "openscad_mcp_render")
 RENDER_TIMEOUT = float(os.environ.get("OPENSCAD_MCP_TIMEOUT", "300"))  # seconds
+CACHE_MAX_MB = float(os.environ.get("OPENSCAD_MCP_CACHE_MAX_MB", "512"))
+PROBE_RETRY_S = 30.0
+SWEEP_EVERY_S = 60.0
 
 _VERSION_RE = re.compile(r"(\d{4})\.(\d{1,2})(?:\.(\d{1,2}))?")
 
@@ -67,6 +72,16 @@ class MeshResult:
     diagnostics: dict[str, Any]
     cached: bool = False
     dimension: int | None = None
+    summary: dict[str, Any] | None = None
+    deps_changed: bool = False  # an input was modified while OpenSCAD rendered
+
+
+@dataclass
+class _Flight:
+    """An in-progress render shared by every caller asking for the same mesh."""
+
+    task: asyncio.Future
+    waiters: int = 0
 
 
 def candidate_binaries() -> list[str]:
@@ -95,9 +110,9 @@ def candidate_binaries() -> list[str]:
     return out
 
 
-def _probe_version(binary: str) -> str:
+def _probe_version(binary: str, flag: str = "--version") -> str:
     try:
-        r = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=15)
+        r = subprocess.run([binary, flag], capture_output=True, text=True, timeout=15)
         return (r.stderr + r.stdout).strip()
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -121,6 +136,11 @@ class OpenSCADClient:
         self._jobs = jobs or int(os.environ.get("OPENSCAD_MCP_JOBS", "0")) or max(1, (os.cpu_count() or 2) - 1)
         self._sem: asyncio.Semaphore | None = None
         self._probed = False
+        self._probe_retry_at = 0.0
+        self._ready_lock = threading.Lock()
+        self._flights: dict[str, _Flight] = {}
+        self._procs: set[asyncio.subprocess.Process] = set()
+        self._last_sweep = 0.0
 
     # ------------------------------------------------------------------
     # Discovery
@@ -144,14 +164,16 @@ class OpenSCADClient:
         # Prefer the newest version; ties keep PATH order.
         return max(cands, key=lambda b: parse_version(_probe_version(b)))
 
-    def probe_features(self) -> Features:
+    def probe_features(self) -> Features | None:
+        """Ask the binary for its version and options (both at once), or None
+        when it answered neither, so the probe is repeated later."""
         assert self.binary
-        version_text = _probe_version(self.binary)
-        try:
-            r = subprocess.run([self.binary, "--help"], capture_output=True, text=True, timeout=15)
-            help_text = r.stdout + r.stderr
-        except (OSError, subprocess.SubprocessError):
-            help_text = ""
+        with ThreadPoolExecutor(2) as pool:
+            version_job = pool.submit(_probe_version, self.binary, "--version")
+            help_job = pool.submit(_probe_version, self.binary, "--help")
+            version_text, help_text = version_job.result(), help_job.result()
+        if not (version_text or help_text):
+            return None
         manifold: list[str] = []
         if "--backend" in help_text:
             manifold = ["--backend=manifold"]
@@ -168,15 +190,29 @@ class OpenSCADClient:
         )
 
     def ensure_ready(self) -> None:
-        """Verify binary exists, probe its features and create directories."""
-        if self.binary is None:
-            self.binary = self.discover_binary()
-        if not self._probed:
-            self.features = self.probe_features()
-            self._probed = True
-        self.workspace.mkdir(parents=True, exist_ok=True)
-        self.libraries.mkdir(parents=True, exist_ok=True)
-        self._sync_library_symlinks()
+        """Verify binary exists, probe its features and create directories.
+
+        Safe to call from the startup thread and from tool calls at once. A
+        binary that does not answer the probe is asked again after
+        PROBE_RETRY_S instead of being treated as featureless for the session.
+        """
+        with self._ready_lock:
+            if self.binary is None:
+                self.binary = self.discover_binary()
+            if not self._probed and time.monotonic() >= self._probe_retry_at:
+                features = self.probe_features()
+                if features is None:
+                    self._probe_retry_at = time.monotonic() + PROBE_RETRY_S
+                    logger.warning("OpenSCAD did not answer --version/--help; will probe again")
+                else:
+                    self.features = features
+                    self._probed = True
+            self.workspace.mkdir(parents=True, exist_ok=True)
+            try:
+                self.libraries.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                logger.debug("Could not create the libraries folder %s", self.libraries)
+            self._sync_library_symlinks()
 
     def _sync_library_symlinks(self) -> None:
         """Create symlinks in workspace for each installed library."""
@@ -231,7 +267,7 @@ class OpenSCADClient:
         thrash the machine. CGAL cache chatter is removed from stderr.
         """
         if self.binary is None or not self._probed:
-            self.ensure_ready()
+            await asyncio.to_thread(self.ensure_ready)
         timeout = timeout or RENDER_TIMEOUT
         cmd = [self.binary, *args]
         logger.debug("Running: %s", " ".join(map(str, cmd)))
@@ -252,6 +288,7 @@ class OpenSCADClient:
                 cwd=str(self.workspace),
                 env=env,
             )
+            self._procs.add(proc)
             try:
                 stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
             except asyncio.TimeoutError:
@@ -264,11 +301,22 @@ class OpenSCADClient:
                 # Cancelled request or client gone: never leave a render running.
                 await _kill(proc)
                 raise
+            finally:
+                self._procs.discard(proc)
 
         stdout = stdout_b.decode(errors="replace")
         stderr = stderr_b.decode(errors="replace")
         stderr = "\n".join(ln for ln in stderr.splitlines() if not ln.startswith("CGAL Cache"))
         return proc.returncode, stdout, stderr
+
+    def kill_children(self) -> None:
+        """Kill every OpenSCAD process still running (the server is being terminated)."""
+        for proc in list(self._procs):
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    logger.debug("OpenSCAD process already exited")
 
     # ------------------------------------------------------------------
     # Paths
@@ -303,9 +351,12 @@ class OpenSCADClient:
                 self.binary,
                 self.features.version_text,
                 str(src),
-                diagnostics.define_args(parameters),
+                sorted(diagnostics.define_args(parameters)[1::2]),  # "name=value", order-free
                 self.features.manifold_args,
                 extra,
+                # The search path decides which library file an include resolves to.
+                self.library_paths(),
+                os.environ.get("OPENSCADPATH", ""),
             ],
             sort_keys=True,
         )
@@ -338,6 +389,34 @@ class OpenSCADClient:
             out.append(str(path.resolve()))
         return sorted(set(out))
 
+    def _cached_mesh(self, key: str) -> MeshResult | None:
+        """The cache entry for `key` if every recorded dependency is unchanged.
+
+        An entry is meta.json naming its own mesh.<tag>.stl, which is never
+        rewritten, so a path handed out stays valid while later renders of the
+        same model publish new files.
+        """
+        entry = self.cache_dir / "mesh" / key
+        meta_file = entry / "meta.json"
+        try:
+            meta = json.loads(meta_file.read_text())
+            stl = entry / meta["stl"]
+            if not (stl.is_file() and meta.get("deps")) or self._digest(list(meta["deps"])) != meta["deps"]:
+                return None
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError, KeyError, TypeError):
+            # Unreadable, corrupt or old-layout entry: render afresh.
+            logger.debug("Ignoring unusable cache entry %s", entry)
+            return None
+        try:
+            os.utime(meta_file)  # last use, for eviction
+            os.utime(stl)  # still in use if a newer render replaces it
+        except OSError:
+            logger.debug("Could not touch %s", meta_file)
+        return MeshResult(True, stl, 0, meta.get("output", ""), meta.get("diagnostics", {}),
+                          cached=True, dimension=3, summary=meta.get("summary"))
+
     async def render_mesh(
         self,
         src: Path,
@@ -347,31 +426,72 @@ class OpenSCADClient:
         extra_args: list[str] | None = None,
     ) -> MeshResult:
         """Render `src` (absolute path) to a binary STL, reusing the cache when
-        neither the file nor anything it includes/imports has changed."""
+        neither the file nor anything it includes/imports has changed.
+
+        Concurrent calls for the same model and parameters share one render
+        (the first caller's timeout applies to it).
+        """
         extra = list(extra_args or [])
         key = self._cache_key(src, parameters, extra)
-        entry = self.cache_dir / "mesh" / key
-        meta_file = entry / "meta.json"
-        stl = entry / "mesh.stl"
-        if use_cache and meta_file.is_file() and stl.is_file():
-            try:
-                meta = json.loads(meta_file.read_text())
-                if meta.get("deps") and self._digest(list(meta["deps"])) == meta["deps"]:
-                    return MeshResult(True, stl, 0, meta.get("output", ""), meta.get("diagnostics", {}),
-                                      cached=True, dimension=3)
-            except (OSError, ValueError):
-                # Unreadable or corrupt cache entry: ignore it and render afresh below.
-                logger.debug("Ignoring unreadable cache entry %s", entry)
+        if not use_cache:
+            return await self._render_mesh(key, src, parameters, timeout, extra)
+        hit = self._cached_mesh(key)
+        if hit is not None:
+            return hit
+        # The source digest keeps a call made after an edit from joining a
+        # render of the previous text.
+        name = f"{key}:{self._digest([str(src)])[str(src)]}"
+        res, joined = await self._single_flight(name, lambda: self._render_mesh(key, src, parameters, timeout, extra))
+        if joined and res.ok and res.deps_changed:
+            # An included or imported file changed while the render this call joined
+            # was running, so its mesh may predate the edit: render the files as they are.
+            res, _ = await self._single_flight(name, lambda: self._render_mesh(key, src, parameters, timeout, extra))
+        return res
 
+    async def _single_flight(self, name: str, factory) -> tuple[MeshResult, bool]:
+        """(result, joined): joined is true when another call had started the render."""
+        flight = self._flights.get(name)
+        joined = flight is not None and not flight.task.done()
+        if not joined:  # a finished or cancelled render is never joined
+            flight = self._flights[name] = _Flight(asyncio.ensure_future(factory()))
+
+            def done(task: asyncio.Future, name: str = name, flight: _Flight = flight) -> None:
+                if self._flights.get(name) is flight:
+                    del self._flights[name]
+                if not task.cancelled():
+                    task.exception()  # retrieved here so a render nobody awaits any more is not logged
+
+            flight.task.add_done_callback(done)
+        flight.waiters += 1
+        try:
+            return await asyncio.shield(flight.task), joined
+        finally:
+            flight.waiters -= 1
+            if flight.waiters == 0 and not flight.task.done():
+                # Every caller went away (cancelled requests): stop the render, and
+                # forget it now so a new call does not join it while it is dying.
+                flight.task.cancel()
+                if self._flights.get(name) is flight:
+                    del self._flights[name]
+
+    async def _render_mesh(
+        self, key: str, src: Path, parameters: dict[str, Any] | None, timeout: float | None, extra: list[str]
+    ) -> MeshResult:
+        entry = self.cache_dir / "mesh" / key
         entry.mkdir(parents=True, exist_ok=True)
+        os.utime(entry)  # in use: the sweep leaves recently touched entries alone
         tag = secrets.token_hex(6)
-        tmp_stl = entry / f"mesh.{tag}.tmp.stl"
+        stl = entry / f"mesh.{tag}.stl"
         deps_file = entry / f"deps.{tag}.mk"
-        args = ["-o", str(tmp_stl), "-d", str(deps_file)]
+        summary_file = entry / f"summary.{tag}.json"
+        args = ["-o", str(stl), "-d", str(deps_file)]
         if self.features.export_format:
             args += ["--export-format", "binstl"]
+        if self.features.summary_file:
+            args += ["--summary-file", str(summary_file)]
         args += self.features.manifold_args + diagnostics.define_args(parameters) + extra + [str(src)]
         started = time.time()
+        keep = False
         try:
             rc, stdout, stderr = await self.run(args, timeout=timeout)
             output = diagnostics.strip_noise(stderr + stdout)
@@ -379,9 +499,15 @@ class OpenSCADClient:
             dimension = diag["stats"].get("dimension")
             if "not a 3D object" in stderr:
                 dimension = 2
-            ok = rc == 0 and tmp_stl.is_file() and not diag["errors"]
+            ok = rc == 0 and stl.is_file() and not diag["errors"]
             if not ok:
                 return MeshResult(False, None, rc, output, diag, dimension=dimension)
+            summary = None
+            if summary_file.is_file():
+                try:
+                    summary = json.loads(summary_file.read_text(errors="replace"))
+                except ValueError:
+                    summary = None
             deps = self._parse_deps(deps_file) or [str(src)]
             # Not cacheable when the dependency list is incomplete (a missing
             # include/use is only a warning and is absent from the -d output) or
@@ -390,16 +516,102 @@ class OpenSCADClient:
                 w["message"].startswith(("Can't open include file", "Can't open library"))
                 for w in diag["warnings"]
             )
+            # Digest first, then look for edits: a file saved after OpenSCAD read it
+            # has mtime >= started and blocks caching; one saved after the digest
+            # only makes the stored digest older than the file (a miss next time).
+            digests = self._digest(deps)
             changed = any(_mtime(p) >= started for p in deps)
-            meta_file.unlink(missing_ok=True)
-            os.replace(tmp_stl, stl)
+            keep = True  # the caller reads this STL; unpublished ones are swept later
             if not (unresolved or changed):
-                meta = {"deps": self._digest(deps), "output": output, "diagnostics": diag, "source": str(src)}
-                meta_file.write_text(json.dumps(meta))
-            return MeshResult(True, stl, rc, output, diag, cached=False, dimension=3)
+                meta = {"stl": stl.name, "deps": digests, "output": output, "diagnostics": diag,
+                        "source": str(src), "summary": summary}
+                tmp_meta = entry / f"meta.{tag}.tmp"
+                tmp_meta.write_text(json.dumps(meta))
+                os.replace(tmp_meta, entry / "meta.json")
+            self._maybe_sweep(keep=entry)
+            return MeshResult(True, stl, rc, output, diag, cached=False, dimension=3, summary=summary,
+                              deps_changed=changed)
         finally:
-            tmp_stl.unlink(missing_ok=True)
+            if not keep:
+                stl.unlink(missing_ok=True)
             deps_file.unlink(missing_ok=True)
+            summary_file.unlink(missing_ok=True)
+
+    def _maybe_sweep(self, keep: Path | None = None) -> None:
+        now = time.monotonic()
+        if now - self._last_sweep >= SWEEP_EVERY_S:
+            self._last_sweep = now
+            try:
+                self.evict(keep=keep)
+            except OSError:
+                logger.debug("Cache sweep failed", exc_info=True)
+
+    def evict(self, keep: Path | None = None, max_bytes: float | None = None,
+              idle_s: float = 3600.0) -> dict[str, Any]:
+        """Keep the cache under OPENSCAD_MCP_CACHE_MAX_MB (default 512).
+
+        Meshes no entry refers to any more (replaced, or from renders that could
+        not be cached) and leftovers of interrupted renders go after an hour;
+        then whole entries go, least recently used first. Entries used within
+        `idle_s` seconds, and `keep`, are never removed, so paths just handed
+        out stay valid. Scratch wrappers unused for a day are removed too.
+        """
+        limit = CACHE_MAX_MB * 1e6 if max_bytes is None else max_bytes
+        now = time.time()
+        entries: list[tuple[float, int, Path]] = []
+        total = 0
+        root = self.cache_dir / "mesh"
+        for d in (os.scandir(root) if root.is_dir() else ()):
+            if not d.is_dir(follow_symlinks=False):
+                continue
+            entry = Path(d.path)
+            try:
+                live = json.loads((entry / "meta.json").read_text()).get("stl")
+                last = (entry / "meta.json").stat().st_mtime
+            except (OSError, ValueError, AttributeError):
+                live, last = None, 0.0
+            size = 0
+            newest = d.stat(follow_symlinks=False).st_mtime
+            for f in os.scandir(entry):
+                try:
+                    st = f.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if f.name not in ("meta.json", live) and now - st.st_mtime > 3600:
+                    Path(f.path).unlink(missing_ok=True)
+                else:
+                    size += st.st_size
+                    newest = max(newest, st.st_mtime)
+            # An entry without meta.json is a render in progress or a mesh that could not
+            # be cached: its newest file says when it was last used.
+            last = max(last, newest)
+            if size == 0:
+                if now - last > 86400:
+                    try:
+                        entry.rmdir()  # left by renders that failed a day ago
+                    except OSError:
+                        # A render started in it meanwhile (it is no longer empty): keep it.
+                        logger.debug("Kept cache entry %s", entry)
+                continue
+            entries.append((last, size, entry))
+            total += size
+        removed = 0
+        for last, size, entry in sorted(entries, key=lambda e: e[0]):
+            if total <= limit:
+                break
+            if entry == keep or now - last < idle_s:
+                continue
+            shutil.rmtree(entry, ignore_errors=True)
+            total -= size
+            removed += 1
+        scratch = self.cache_dir / "scratch"
+        for f in (os.scandir(scratch) if scratch.is_dir() else ()):
+            try:
+                if f.is_file(follow_symlinks=False) and now - f.stat().st_mtime > 86400:
+                    Path(f.path).unlink(missing_ok=True)
+            except OSError:
+                continue
+        return {"entries_removed": removed, "cache_bytes": total, "limit_bytes": int(limit)}
 
     def clear_cache(self) -> dict[str, Any]:
         """Remove only what this server owns (mesh/ and scratch/) under cache_dir."""
@@ -419,8 +631,10 @@ class OpenSCADClient:
         """Write generated OpenSCAD code to a content-addressed scratch file."""
         name = hashlib.sha256(code.encode()).hexdigest()[:24] + ".scad"
         path = self.scratch_dir() / name
-        if not path.exists():
-            tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        try:
+            os.utime(path)  # in use again: keep it from the scratch sweep
+        except FileNotFoundError:
+            tmp = path.with_suffix(f".{secrets.token_hex(4)}.tmp")
             tmp.write_text(code, encoding="utf-8")
             os.replace(tmp, path)
         return path
@@ -473,7 +687,10 @@ class OpenSCADClient:
         src = src_path or self.resolve_path(scad_file)
         dst = self.resolve_path(output_png)
         dst.parent.mkdir(parents=True, exist_ok=True)
-        args = ["-o", str(dst), "--imgsize", f"{imgsize[0]},{imgsize[1]}", "--autocenter", "--viewall"]
+        # Extra options go first: on 2021.01 "--render" takes an optional value and
+        # would swallow the input path if it came last.
+        args = ["-o", str(dst), *(extra_args or []),
+                "--imgsize", f"{imgsize[0]},{imgsize[1]}", "--autocenter", "--viewall"]
         if camera:
             args.extend(["--camera", camera])
         if colorscheme:
@@ -481,8 +698,6 @@ class OpenSCADClient:
         if projection:
             args.extend(["--projection", projection])
         args += diagnostics.define_args(parameters)
-        if extra_args:
-            args.extend(extra_args)
         args.append(str(src))
         return await self.run(args, timeout=timeout)
 
@@ -521,13 +736,15 @@ class OpenSCADClient:
             _check_expression(expr)
             lines.append(f"echo(__mcp_{nonce}_{i} = ({expr}));")
         wrapper = self.write_wrapper("\n".join(lines) + "\n")
-        with tempfile.TemporaryDirectory() as tmp:
-            echo_file = Path(tmp) / "eval.echo"
-            rc, stdout, stderr = await self.run(
-                ["-o", str(echo_file), *diagnostics.define_args(parameters), str(wrapper)], timeout=60
-            )
-            text = (echo_file.read_text(errors="replace") if echo_file.exists() else "") + stderr
-        wrapper.unlink(missing_ok=True)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                echo_file = Path(tmp) / "eval.echo"
+                rc, stdout, stderr = await self.run(
+                    ["-o", str(echo_file), *diagnostics.define_args(parameters), str(wrapper)], timeout=60
+                )
+                text = (echo_file.read_text(errors="replace") if echo_file.exists() else "") + stderr
+        finally:
+            wrapper.unlink(missing_ok=True)
         values: dict[int, str] = {}
         for m in re.finditer(rf"^ECHO: __mcp_{nonce}_(\d+) = (.*)$", text, re.M):
             values.setdefault(int(m.group(1)), m.group(2).strip())
@@ -576,28 +793,6 @@ class OpenSCADClient:
             if res[0] != 0:
                 return res
         return results[-1]
-
-    async def get_info(self, scad_file: str, summary_file: str) -> tuple[int, str, str]:
-        """Render statistics, written as JSON to summary_file."""
-        src = self.resolve_path(scad_file)
-        summary = self.resolve_path(summary_file)
-        if self.features.summary_file:
-            null = os.devnull
-            args = ["-o", null, "--export-format", "binstl", "--summary-file", str(summary),
-                    *self.features.manifold_args, str(src)]
-            rc, stdout, stderr = await self.run(args)
-            if rc == 0:
-                return rc, stdout, stderr
-        # OpenSCAD < 2023 has no --summary-file: parse the console stats.
-        args = ["-o", os.devnull]
-        if self.features.export_format:
-            args += ["--export-format", "binstl"]
-        rc, stdout, stderr = await self.run(args + [str(src)])
-        if rc != 0:
-            return rc, stdout, stderr
-        parsed = diagnostics.parse_output(stderr)
-        summary.write_text(json.dumps({"geometry": parsed["stats"]}, indent=2))
-        return rc, stdout, stderr
 
 
 async def _kill(proc: asyncio.subprocess.Process) -> None:
