@@ -3,7 +3,7 @@ import logging
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from openscad_mcp.client import OpenSCADClient
 from openscad_mcp.tools.design_tools import register_design_tools
@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
-async def server_lifespan(server: FastMCP) -> AsyncIterator[dict]:
+async def server_lifespan(server: MCPServer) -> AsyncIterator[dict]:
     client = OpenSCADClient()
     client.ensure_ready()
     logger.info("OpenSCAD MCP server starting — binary: %s", client.binary)
@@ -24,7 +24,7 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[dict]:
         logger.info("OpenSCAD MCP server stopped")
 
 
-mcp = FastMCP("openscad", lifespan=server_lifespan)
+mcp = MCPServer("openscad", lifespan=server_lifespan)
 
 register_design_tools(mcp)
 register_render_tools(mcp)

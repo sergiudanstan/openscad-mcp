@@ -110,7 +110,7 @@ The `examples/` directory includes sample `.scad` files:
 ```
 openscad-mcp/
 ├── src/openscad_mcp/
-│   ├── server.py           # FastMCP server setup
+│   ├── server.py           # MCPServer server setup
 │   ├── client.py           # OpenSCAD CLI wrapper
 │   └── tools/
 │       ├── design_tools.py   # create / read / edit
