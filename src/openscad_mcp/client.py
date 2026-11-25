@@ -590,7 +590,8 @@ class OpenSCADClient:
                     try:
                         entry.rmdir()  # left by renders that failed a day ago
                     except OSError:
-                        pass
+                        # A render started in it meanwhile (it is no longer empty): keep it.
+                        logger.debug("Kept cache entry %s", entry)
                 continue
             entries.append((last, size, entry))
             total += size
