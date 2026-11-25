@@ -1,12 +1,18 @@
 """Library tools: listing files, cheatsheet, version, syntax check, examples, library management."""
 
-import json
+from __future__ import annotations
+
+import os
 from pathlib import Path
+from typing import Any
 
-from mcp.server.mcpserver import MCPServer, Context
+from mcp.server.mcpserver import Context, MCPServer
 
-# Examples directory: openscad-mcp/examples/ (two package levels + src + project root)
-_EXAMPLES_DIR = Path(__file__).resolve().parent.parent.parent.parent / "examples"
+from openscad_mcp import diagnostics
+from openscad_mcp.tools._common import OVERWRITES, Params, READ_ONLY, WRITES_OUTPUT, fail, get_client, tool
+
+# Examples ship inside the package so they exist in wheel installs too.
+_EXAMPLES_DIR = Path(__file__).resolve().parent.parent / "examples"
 
 # Library descriptions for all 25 official OpenSCAD libraries + MCAD
 _LIBRARY_INFO = {
@@ -175,166 +181,205 @@ OpenSCAD Quick Reference (v2021.01)
 """
 
 
+
+_SKIP_DIRS = {".git", ".cache", "__pycache__", "node_modules", ".venv"}
+
+
+def _workspace_scad_files(root: Path) -> list[Path]:
+    """.scad files under root, not following symlinks (libraries are symlinked in)."""
+    out: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in _SKIP_DIRS and not d.startswith(".") and not os.path.islink(os.path.join(dirpath, d))
+        ]
+        out.extend(Path(dirpath) / f for f in filenames if f.endswith(".scad"))
+    return sorted(out)
+
+
+def _library_entry(lib_dir: Path) -> dict[str, Any]:
+    name = lib_dir.name
+    scad_files = list(lib_dir.rglob("*.scad"))
+    main_files = sorted(
+        (f for f in scad_files if f.stem.lower() in (name.lower(), "main", "std", "core", "lib", "all")),
+        key=lambda f: len(f.relative_to(lib_dir).parts),
+    )
+    entry = main_files[0].relative_to(lib_dir) if main_files else None
+    return {
+        "name": name,
+        "description": _LIBRARY_INFO.get(name, "Community library"),
+        "scad_files": len(scad_files),
+        "entry_point": str(entry) if entry else None,
+        "use_example": f"include <{name}/{entry}>" if entry else f"use <{name}/...>",
+        "path": str(lib_dir),
+    }
+
+
 def register_library_tools(mcp: MCPServer) -> None:
     """Register library / utility tools with the MCP server."""
 
-    @mcp.tool()
-    async def openscad_list_files(ctx: Context) -> str:
-        """List all .scad files currently in the workspace."""
-        try:
-            client = ctx.request_context.lifespan_context["client"]
-            files = sorted(p.name for p in client.workspace.glob("**/*.scad"))
-            return json.dumps({"files": files, "count": len(files)})
-        except Exception as e:
-            return json.dumps({"error": str(e)})
+    @tool(mcp, annotations=READ_ONLY)
+    async def openscad_list_files(ctx: Context, pattern: str | None = None) -> dict[str, Any]:
+        """List .scad files in the workspace (relative paths, size, modified time).
 
-    @mcp.tool()
+        Symlinked library folders are skipped. `pattern` filters by substring.
+        """
+        client = get_client(ctx)
+        root = client.workspace.resolve()
+        files = []
+        for p in _workspace_scad_files(root):
+            rel = str(p.relative_to(root))
+            if pattern and pattern.lower() not in rel.lower():
+                continue
+            st = p.stat()
+            files.append({"path": rel, "bytes": st.st_size, "modified": int(st.st_mtime)})
+        return {"files": [f["path"] for f in files], "details": files, "count": len(files), "workspace": str(root)}
+
+    @tool(mcp, annotations=READ_ONLY)
     async def openscad_cheatsheet(ctx: Context) -> str:
         """Return an OpenSCAD language quick reference / cheatsheet."""
         return _CHEATSHEET
 
-    @mcp.tool()
-    async def openscad_version(ctx: Context) -> str:
-        """Get the installed OpenSCAD version."""
-        try:
-            client = ctx.request_context.lifespan_context["client"]
-            version_text = await client.version()
-            return json.dumps({"version": version_text})
-        except Exception as e:
-            return json.dumps({"error": str(e)})
+    @tool(mcp, annotations=READ_ONLY)
+    async def openscad_version(ctx: Context) -> dict[str, Any]:
+        """Get the installed OpenSCAD version, binary, geometry backend and paths."""
+        client = get_client(ctx)
+        version_text = await client.version()
+        return {
+            "version": version_text,
+            "binary": client.binary,
+            "backend": client.features.backend,
+            "summary_file_support": client.features.summary_file,
+            "workspace": str(client.workspace),
+            "library_paths": client.library_paths(),
+            "cache_dir": str(client.cache_dir),
+        }
 
-    @mcp.tool()
-    async def openscad_check_syntax(ctx: Context, filename: str) -> str:
-        """Dry-run a .scad file to check for syntax errors without rendering.
+    @tool(mcp, annotations=READ_ONLY)
+    async def openscad_check_syntax(ctx: Context, filename: str, parameters: Params = None) -> dict[str, Any]:
+        """Parse and evaluate a .scad file without building geometry (fast).
 
-        Args:
-            filename: Name of the .scad file (relative to workspace).
+        `passed` is false whenever OpenSCAD reports an ERROR (parse errors,
+        failed asserts), whatever its exit code; `strict_passed` additionally
+        requires no warnings (unknown modules/variables are only warnings).
+        Each error/warning carries file and line when OpenSCAD gives them.
         """
+        client = get_client(ctx)
+        if not client.resolve_path(filename).is_file():
+            fail(f"File not found: {filename}")
         try:
-            client = ctx.request_context.lifespan_context["client"]
-            rc, stdout, stderr = await client.check_syntax(filename)
-            passed = rc == 0
-            return json.dumps({
-                "filename": filename,
-                "passed": passed,
-                "returncode": rc,
-                "stdout": stdout,
-                "stderr": stderr,
-                "errors": [line for line in stderr.splitlines() if "ERROR" in line.upper()],
-            })
-        except Exception as e:
-            return json.dumps({"error": str(e)})
+            rc, stdout, stderr = await client.check_syntax(filename, parameters)
+        except ValueError as exc:
+            fail(str(exc))
+        d = diagnostics.parse_output(stderr + stdout)
+        passed = rc == 0 and not d["errors"]
+        return {
+            "filename": filename,
+            "passed": passed,
+            "strict_passed": passed and not d["warnings"],
+            "returncode": rc,
+            "errors": d["errors"][:100],
+            "warnings": d["warnings"][:100],
+            "echo": d["echo"][:200],
+            "stderr": diagnostics.truncate(diagnostics.strip_noise(stderr).strip()),
+        }
 
-    @mcp.tool()
-    async def openscad_list_examples(ctx: Context) -> str:
+    @tool(mcp, annotations=READ_ONLY)
+    async def openscad_list_examples(ctx: Context) -> dict[str, Any]:
         """List built-in example .scad files shipped with the server."""
-        try:
-            if not _EXAMPLES_DIR.exists():
-                return json.dumps({"examples": [], "note": "examples/ directory not found"})
-            examples = sorted(p.name for p in _EXAMPLES_DIR.glob("*.scad"))
-            return json.dumps({
-                "examples": examples,
-                "count": len(examples),
-                "directory": str(_EXAMPLES_DIR),
-            })
-        except Exception as e:
-            return json.dumps({"error": str(e)})
+        if not _EXAMPLES_DIR.exists():
+            return {"examples": [], "note": "examples directory not found"}
+        examples = sorted(p.name for p in _EXAMPLES_DIR.glob("*.scad"))
+        return {"examples": examples, "count": len(examples), "directory": str(_EXAMPLES_DIR)}
 
-    @mcp.tool()
-    async def openscad_list_libraries(ctx: Context) -> str:
+    @tool(mcp, annotations=WRITES_OUTPUT)
+    async def openscad_get_example(ctx: Context, name: str, copy_to_workspace: bool = True) -> dict[str, Any]:
+        """Return a built-in example's source; by default also copy it into the
+        workspace (examples/<name>) so the render tools can use it."""
+        client = get_client(ctx)
+        fname = name if name.endswith(".scad") else f"{name}.scad"
+        src = (_EXAMPLES_DIR / fname).resolve()
+        if src.parent != _EXAMPLES_DIR.resolve() or not src.is_file():
+            fail(f"Example not found: {name}", available=sorted(p.name for p in _EXAMPLES_DIR.glob("*.scad")))
+        code = src.read_text(encoding="utf-8")
+        result: dict[str, Any] = {"name": fname, "content": code}
+        if copy_to_workspace:
+            dst = client.resolve_path(f"examples/{fname}")
+            result["workspace_file"] = f"examples/{fname}"
+            if dst.is_file() and dst.read_text(encoding="utf-8", errors="replace") != code:
+                result["note"] = "Workspace copy differs (edited?) and was left unchanged."
+            else:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.write_text(code, encoding="utf-8")
+        return result
+
+    @tool(mcp, annotations=READ_ONLY)
+    async def openscad_list_libraries(ctx: Context) -> dict[str, Any]:
         """List all installed OpenSCAD libraries with descriptions and usage examples.
 
         Libraries are auto-loaded via OPENSCADPATH. Use them with:
           use <LibraryName/module.scad>
           include <LibraryName/module.scad>
         """
-        try:
-            client = ctx.request_context.lifespan_context["client"]
-            libs = []
+        client = get_client(ctx)
+        libs = []
+        if client.libraries.is_dir():
             for lib_dir in sorted(client.libraries.iterdir()):
                 if lib_dir.is_dir() and not lib_dir.name.startswith("."):
-                    name = lib_dir.name
-                    # Count .scad files
-                    scad_files = list(lib_dir.rglob("*.scad"))
-                    # Find main entry point
-                    main_files = [f for f in scad_files if f.stem.lower() in (
-                        name.lower(), "main", "std", "core", "lib", "all"
-                    )]
-                    entry = main_files[0].relative_to(lib_dir) if main_files else None
-                    libs.append({
-                        "name": name,
-                        "description": _LIBRARY_INFO.get(name, "Community library"),
-                        "scad_files": len(scad_files),
-                        "entry_point": str(entry) if entry else None,
-                        "use_example": f'use <{name}/{entry}>' if entry else f'use <{name}/...>',
-                        "path": str(lib_dir),
-                    })
+                    libs.append(_library_entry(lib_dir))
+        bundled = client.bundled_library_dir()
+        if bundled:
+            for lib_dir in sorted(bundled.iterdir()):
+                if lib_dir.is_dir() and not lib_dir.name.startswith(".") and all(lib["name"] != lib_dir.name for lib in libs):
+                    entry = _library_entry(lib_dir)
+                    entry["bundled"] = True
+                    if lib_dir.name == "MCAD":
+                        entry["use_example"] = "use <MCAD/gears.scad>"
+                    libs.insert(0, entry)
+        return {"libraries": libs, "count": len(libs), "library_path": str(client.libraries)}
 
-            # Also check for MCAD in app bundle
-            mcad_path = Path("/Applications/OpenSCAD-2021.01.app/Contents/Resources/libraries/MCAD")
-            if mcad_path.is_dir():
-                scad_files = list(mcad_path.rglob("*.scad"))
-                libs.insert(0, {
-                    "name": "MCAD",
-                    "description": _LIBRARY_INFO.get("MCAD", "Built-in library"),
-                    "scad_files": len(scad_files),
-                    "entry_point": None,
-                    "use_example": 'use <MCAD/gears.scad>',
-                    "path": str(mcad_path),
-                })
-
-            return json.dumps({
-                "libraries": libs,
-                "count": len(libs),
-                "library_path": str(client.libraries),
-            })
-        except Exception as e:
-            return json.dumps({"error": str(e)})
-
-    @mcp.tool()
-    async def openscad_library_info(ctx: Context, library_name: str) -> str:
-        """Get detailed info about a specific library: files, modules, usage.
+    @tool(mcp, annotations=READ_ONLY)
+    async def openscad_library_info(ctx: Context, library_name: str) -> dict[str, Any]:
+        """Get detailed info about a specific library: files, README excerpt, usage.
 
         Args:
-            library_name: Name of the library (e.g. "BOSL2", "NopSCADlib", "SCON").
+            library_name: Name of the library (e.g. "BOSL2", "NopSCADlib", "MCAD").
         """
-        try:
-            client = ctx.request_context.lifespan_context["client"]
-            lib_dir = client.libraries / library_name
-            # A library is a direct child of the libraries directory (it may itself be a symlink).
-            if Path(library_name).name != library_name or library_name in ("", ".", ".."):
-                return json.dumps({"error": f"Library not found: {library_name}"})
-            if not lib_dir.is_dir():
-                return json.dumps({"error": f"Library not found: {library_name}"})
-
-            # Collect all .scad files organized by subdirectory
-            scad_files = sorted(lib_dir.rglob("*.scad"))
-            file_tree = {}
-            for f in scad_files:
-                rel = f.relative_to(lib_dir)
-                parent = str(rel.parent) if str(rel.parent) != "." else "/"
-                if parent not in file_tree:
-                    file_tree[parent] = []
-                file_tree[parent].append(rel.name)
-
-            # Read README if available
-            readme = None
-            for readme_name in ("README.md", "readme.md", "README.txt", "README"):
-                readme_path = lib_dir / readme_name
-                if readme_path.exists():
-                    content = readme_path.read_text(encoding="utf-8", errors="replace")
-                    # Truncate to first 2000 chars
-                    readme = content[:2000] + ("..." if len(content) > 2000 else "")
+        client = get_client(ctx)
+        lib_dir = None
+        # A library is a direct child of a libraries directory (it may itself be a symlink).
+        if Path(library_name).name == library_name and library_name not in ("", ".", ".."):
+            for base in (client.libraries, client.bundled_library_dir()):
+                if base and (base / library_name).is_dir():
+                    lib_dir = base / library_name
                     break
+        if lib_dir is None:
+            fail(f"Library not found: {library_name}")
+        scad_files = sorted(lib_dir.rglob("*.scad"))
+        file_tree: dict[str, list[str]] = {}
+        for f in scad_files:
+            rel = f.relative_to(lib_dir)
+            parent = str(rel.parent) if str(rel.parent) != "." else "/"
+            file_tree.setdefault(parent, []).append(rel.name)
+        readme = None
+        for readme_name in ("README.md", "readme.md", "README.txt", "README"):
+            readme_path = lib_dir / readme_name
+            if readme_path.exists():
+                content = readme_path.read_text(encoding="utf-8", errors="replace")
+                readme = content[:2000] + ("..." if len(content) > 2000 else "")
+                break
+        return {
+            "name": library_name,
+            "description": _LIBRARY_INFO.get(library_name, "Community library"),
+            "path": str(lib_dir),
+            "total_scad_files": len(scad_files),
+            "file_tree": file_tree,
+            "readme_excerpt": readme,
+            "usage": f"use <{library_name}/filename.scad>",
+        }
 
-            return json.dumps({
-                "name": library_name,
-                "description": _LIBRARY_INFO.get(library_name, "Community library"),
-                "path": str(lib_dir),
-                "total_scad_files": len(scad_files),
-                "file_tree": file_tree,
-                "readme_excerpt": readme,
-                "usage": f'use <{library_name}/filename.scad>',
-            })
-        except Exception as e:
-            return json.dumps({"error": str(e)})
+    @tool(mcp, annotations=OVERWRITES)
+    async def openscad_clear_cache(ctx: Context) -> dict[str, Any]:
+        """Delete cached meshes and generated scratch files; reports space freed."""
+        client = get_client(ctx)
+        return client.clear_cache()

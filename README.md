@@ -21,33 +21,52 @@ An MCP (Model Context Protocol) server that lets AI assistants like Claude creat
 
 ## What It Does
 
-Connect this server to Claude Desktop and you can ask Claude to:
+Connect this server to Claude Desktop or Claude Code and you can ask Claude to:
 
-- **Design** parametric 3D models in OpenSCAD
-- **Preview** renders as PNG images
-- **Export** to STL, 3MF, AMF, DXF, SVG, and more
-- **Animate** models using OpenSCAD's `$t` variable
-- **Check syntax** before rendering
-- **Browse** an OpenSCAD language cheatsheet
+- **Design** parametric 3D models in OpenSCAD, editing them with small exact-snippet replacements
+- **See** its work: previews come back as images, several standard views per call, rendered in parallel
+- **Measure** exactly: bounding box, volume, surface area, centroid, watertightness, separate bodies (2D: area, perimeter)
+- **Analyse** like an engineer: mass, centre of mass and inertia; interference between two parts;
+  section cuts for wall thickness; an FDM print report (overhangs, bed contact, build volume)
+- **Check** models with errors and warnings tied to file and line — including failed `assert()`s,
+  which OpenSCAD itself exits 0 on
+- **Export** to STL (binary), 3MF, OFF, AMF, DXF, SVG, PDF, CSG; **animate** `$t` to PNG frames + MP4
+
+Renders are cached by the content of the file **and everything it includes or imports**, so repeated
+measurements of a model are milliseconds instead of a full CGAL render (on the bundled
+`factory_arduino_assembly.scad`: 138 s first render, 0.12 s afterwards). With an OpenSCAD build that has
+the Manifold backend, the server uses it automatically.
 
 ## Available Tools
 
 | Tool | Description |
 |------|-------------|
-| `openscad_create` | Create a new `.scad` file |
-| `openscad_read` | Read an existing `.scad` file |
-| `openscad_edit` | Update an existing `.scad` file |
-| `openscad_export` | Export to STL, 3MF, OFF, AMF, DXF, SVG, PDF |
-| `openscad_preview` | Render a PNG preview with camera/color options |
-| `openscad_render_animated` | Render animation frames using `$t` |
-| `openscad_get_info` | Get model render statistics |
-| `openscad_list_files` | List `.scad` files in the workspace |
-| `openscad_check_syntax` | Dry-run syntax validation |
+| `openscad_create` | Create a `.scad` file (returns an etag) |
+| `openscad_read` | Read a `.scad` file, optionally with line numbers |
+| `openscad_edit` | Replace the whole file, or an exact `old_string` → `new_string`; optional etag guard |
+| `openscad_get_parameters` | Customizer parameters: values, `[min:step:max]` constraints, descriptions, groups |
+| `openscad_check_syntax` | Parse + evaluate without geometry; structured errors/warnings/echo with lines |
+| `openscad_eval` | Evaluate expressions in a model's scope (`"wall*2 + clearance"`) |
+| `openscad_preview` | PNG preview(s) returned as images; `views=["isometric","front","top","right",…]` |
+| `openscad_measure` | Exact bbox, volume, area, centroid, watertight, bodies (2D: area, perimeter) |
+| `openscad_mass_properties` | Mass, centre of mass, inertia tensor and principal moments for a material/density |
+| `openscad_interference` | Overlap volume/bbox between two parts, or clear / touching |
+| `openscad_section` | Cut at `axis=offset`: section area, 2D bbox, regions and an image |
+| `openscad_print_report` | Overhang area, bed contact, build-volume fit, issues list |
+| `openscad_export` | Export to STL, 3MF, OFF, AMF, DXF, SVG, PDF, CSG, ECHO, AST, PNG |
+| `openscad_render_animated` | Frames from `$t`, joined into an MP4 when ffmpeg is available |
+| `openscad_get_info` | Render statistics |
+| `openscad_list_files` | `.scad` files in the workspace (relative paths, libraries skipped) |
+| `openscad_list_examples` / `openscad_get_example` | Bundled examples; copy one into the workspace |
+| `openscad_list_libraries` / `openscad_library_info` | Installed libraries (incl. bundled MCAD) |
 | `openscad_cheatsheet` | OpenSCAD language quick reference |
-| `openscad_version` | Get installed OpenSCAD version |
-| `openscad_list_examples` | List built-in example files |
-| `openscad_list_libraries` | List installed OpenSCAD libraries |
-| `openscad_library_info` | Files and README excerpt of one installed library |
+| `openscad_version` | Version, binary, backend (cgal/manifold), paths |
+| `openscad_clear_cache` | Drop cached meshes |
+
+Parameters are typed JSON — `{"width": 40, "label": "A", "holes": [3, 5], "solid": true}`; strings that
+already are numbers or vectors (`"10"`, `"[1,2]"`) pass through unchanged. Errors come back with
+`isError: true`. Tools carry MCP annotations (read-only vs. writing), and the server sends usage
+instructions to the client.
 
 ## Quick Start
 
@@ -93,30 +112,33 @@ Restart Claude Desktop — the OpenSCAD tools will appear in the hammer icon.
 
 ```bash
 claude mcp add openscad -s user -- /full/path/to/openscad-mcp/.venv/bin/python -m openscad_mcp
+# or, without a clone (the PyPI name `openscad-mcp` belongs to a different project):
+claude mcp add openscad -s user -- uvx --from git+https://github.com/sergiudanstan/openscad-mcp openscad-mcp
 ```
 
 Start a new Claude Code session and the `openscad_*` tools will be available.
 
 ## Examples
 
-The `examples/` directory includes sample `.scad` files:
-
-- **box.scad** — Simple parametric box
-- **gear.scad** — Involute spur gear
-- **vase.scad** — Curved vase with twist
+`src/openscad_mcp/examples/` ships 14 sample models (box, gear, vase, linkages, gear train, mobile
+robot, pick-and-place arm, factory assembly, …); they are packaged, so `openscad_get_example` works
+in a wheel install too. Every one is parsed in the test suite.
 
 ## Project Structure
 
 ```
 openscad-mcp/
 ├── src/openscad_mcp/
-│   ├── server.py           # MCPServer server setup
-│   ├── client.py           # OpenSCAD CLI wrapper
+│   ├── server.py           # MCPServer setup and instructions
+│   ├── client.py           # OpenSCAD CLI wrapper, discovery, mesh cache
+│   ├── geometry.py         # pure-Python mesh/2D analysis (no extra dependencies)
+│   ├── diagnostics.py      # console parsing, typed parameters, customizer extraction
+│   ├── examples/           # sample .scad files (packaged)
 │   └── tools/
-│       ├── design_tools.py   # create / read / edit
-│       ├── render_tools.py   # preview / export / animate
-│       └── library_tools.py  # list files / cheatsheet / syntax check
-├── examples/               # Sample .scad files
+│       ├── design_tools.py   # create / read / edit / parameters
+│       ├── render_tools.py   # preview / export / animate / info
+│       ├── analysis_tools.py # measure / mass / interference / section / print report / eval
+│       └── library_tools.py  # files / syntax check / examples / libraries / cache
 ├── tests/                  # Test suite
 └── pyproject.toml
 ```
@@ -128,15 +150,23 @@ openscad-mcp/
 - **No credentials or API keys** — runs locally and makes no outgoing network calls
 - **HTTP mode is unauthenticated** — with `MCP_TRANSPORT=streamable-http` or `sse` the server listens on `0.0.0.0` with host validation disabled; see [SECURITY.md](SECURITY.md) before exposing it
 
-## Workspace
+## Configuration
 
-All files are created in `~/openscad-mcp-workspace/` by default.
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `OPENSCAD_BINARY` | newest OpenSCAD found | Binary to use (PATH, `/Applications/OpenSCAD*.app`, `~/Applications`, Linux/Windows paths are searched) |
+| `OPENSCAD_MCP_WORKSPACE` | `~/openscad-mcp-workspace` | Where files are created; all paths are confined to it |
+| `OPENSCAD_MCP_LIBRARIES` | `~/Documents/OpenSCAD/libraries` | Extra libraries, put on `OPENSCADPATH` |
+| `OPENSCAD_MCP_CACHE` | `~/.cache/openscad_mcp_render` | Mesh cache |
+| `OPENSCAD_MCP_TIMEOUT` | `300` | Default render timeout in seconds (tools also take `timeout`) |
+| `OPENSCAD_MCP_JOBS` | CPUs − 1 | Maximum concurrent OpenSCAD processes |
+| `OPENSCAD_MCP_BACKEND` | auto | Set `cgal` to disable Manifold on builds that have it |
 
 ## Running Tests
 
 ```bash
 pip install -e ".[dev]"
-pytest tests/   # tests that run the real CLI need `openscad` on PATH
+pytest tests/   # tests that run the real CLI need `openscad` on PATH (Linux: run under xvfb-run for PNGs)
 ```
 
 ## Full Installation Guide
