@@ -22,7 +22,8 @@ All notable changes to this project are documented here. The format follows
 - Mesh cache keyed by the file and every file it includes or imports (`-d` dependency output).
 - Automatic Manifold backend on OpenSCAD builds that have it; newest installed OpenSCAD is
   preferred; `OPENSCAD_BINARY`, `OPENSCAD_MCP_*` environment configuration.
-- Animations are joined into an MP4 when ffmpeg is available; frame list in the result.
+- Animations render each frame as its own run in parallel (OpenSCAD 2021 `--animate` crashes
+  under Xvfb) and are joined into an MP4 when ffmpeg is available; frame list in the result.
 - Server instructions for clients, tool annotations, structured tool results; `openscad-mcp`
   console script (`uvx --from git+…`).
 - Tests: geometry and parser unit tests, real-OpenSCAD tests for every tool with perturbation

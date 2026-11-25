@@ -154,8 +154,11 @@ class TestRenderTools:
     async def test_animation_frames_and_missing_ffmpeg(self, tools):
         await make(tools, "anim.scad", "rotate([0, 0, 360 * $t]) cube([20, 5, 5]);")
         with patch("openscad_mcp.tools.render_tools.shutil.which", return_value=None):
-            res = await tools("openscad_render_animated")(filename="anim.scad", num_frames=4, width=120, height=90)
-        assert res["frames_written"] == 4 and "ffmpeg not found" in res["mp4_error"]
+            res = await tools("openscad_render_animated")(filename="anim.scad", num_frames=3, width=120, height=90)
+        assert res["frames_written"] == 3 and "ffmpeg not found" in res["mp4_error"]
+        # Perturbation: $t really varies per frame (0, 120, 240 deg), so every frame differs.
+        frames = sorted(Path(res["first_frame"]).parent.glob("anim_frame*.png"))
+        assert len({f.read_bytes() for f in frames}) == 3
 
 
 class TestDesignTools:

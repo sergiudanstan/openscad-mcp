@@ -546,21 +546,35 @@ class OpenSCADClient:
         extra_args: list[str] | None = None,
         timeout: float | None = None,
     ) -> tuple[int, str, str]:
-        """Render animation frames using the $t variable."""
+        """Render animation frames <prefix>NNNNN.png with $t = i / num_frames.
+
+        Each frame is its own OpenSCAD run (in parallel, up to the job limit)
+        instead of `--animate`, which crashes under Xvfb on OpenSCAD 2021
+        (X BadLength after a few frames) and renders frames one at a time.
+        Returns (rc, stdout, stderr) of the first failing frame, else the last.
+        """
         src = self.resolve_path(scad_file)
         dst = self.resolve_path(output_prefix)
         dst.parent.mkdir(parents=True, exist_ok=True)
-        args = [
-            "-o", str(dst),
-            "--imgsize", f"{imgsize[0]},{imgsize[1]}",
-            "--animate", str(num_frames),
-            "--autocenter",
-            "--viewall",
-        ]
-        if extra_args:
-            args.extend(extra_args)
-        args.append(str(src))
-        return await self.run(args, timeout=timeout or max(RENDER_TIMEOUT, num_frames * 5))
+        stem = dst.with_suffix("")
+
+        async def frame(i: int) -> tuple[int, str, str]:
+            args = [
+                "-o", f"{stem}{i:05d}.png",
+                "--imgsize", f"{imgsize[0]},{imgsize[1]}",
+                "--autocenter",
+                "--viewall",
+                "-D", f"$t={i / num_frames!r}",
+                *(extra_args or []),
+                str(src),
+            ]
+            return await self.run(args, timeout=timeout)
+
+        results = await asyncio.gather(*(frame(i) for i in range(num_frames)))
+        for res in results:
+            if res[0] != 0:
+                return res
+        return results[-1]
 
     async def get_info(self, scad_file: str, summary_file: str) -> tuple[int, str, str]:
         """Render statistics, written as JSON to summary_file."""
