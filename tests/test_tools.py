@@ -1,6 +1,5 @@
 """Tests for openscad_mcp tools."""
 
-import json
 import shutil
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -26,8 +25,10 @@ def tmp_workspace(tmp_path: Path) -> Path:
 @pytest.fixture()
 def client(tmp_workspace: Path) -> OpenSCADClient:
     """Return an OpenSCADClient pointed at a temporary workspace."""
-    c = OpenSCADClient(workspace=tmp_workspace)
+    c = OpenSCADClient(workspace=tmp_workspace, libraries=tmp_workspace.parent / "libs",
+                       cache_dir=tmp_workspace.parent / "cache")
     c.binary = shutil.which("openscad") or "/Applications/OpenSCAD.app/Contents/MacOS/OpenSCAD"
+    c._probed = True  # mock tests must not depend on a real binary
     return c
 
 
@@ -69,17 +70,28 @@ class TestDiscoverBinary:
         fake_binary.write_text("#!/bin/sh\necho ok\n")
         fake_binary.chmod(0o755)
 
-        with patch("shutil.which", return_value=str(fake_binary)):
+        with patch("openscad_mcp.client.candidate_binaries", return_value=[str(fake_binary)]):
             c = OpenSCADClient(workspace=tmp_workspace)
             result = c.discover_binary()
         assert result == str(fake_binary)
 
+    def test_env_override_wins(self, tmp_workspace: Path, monkeypatch) -> None:
+        fake_binary = tmp_workspace / "my-openscad"
+        fake_binary.write_text("#!/bin/sh\n")
+        monkeypatch.setenv("OPENSCAD_BINARY", str(fake_binary))
+        assert OpenSCADClient(workspace=tmp_workspace).discover_binary() == str(fake_binary)
+
+    def test_prefers_newest_version(self, tmp_workspace: Path) -> None:
+        versions = {"/old/openscad": "OpenSCAD version 2021.01", "/new/openscad": "OpenSCAD version 2026.10.11"}
+        with (
+            patch("openscad_mcp.client.candidate_binaries", return_value=list(versions)),
+            patch("openscad_mcp.client._probe_version", side_effect=versions.get),
+        ):
+            assert OpenSCADClient(workspace=tmp_workspace).discover_binary() == "/new/openscad"
+
     def test_raises_when_not_found(self, tmp_workspace: Path) -> None:
         """discover_binary raises FileNotFoundError if nothing found."""
-        with (
-            patch("shutil.which", return_value=None),
-            patch("os.path.isfile", return_value=False),
-        ):
+        with patch("openscad_mcp.client.candidate_binaries", return_value=[]):
             c = OpenSCADClient(workspace=tmp_workspace)
             with pytest.raises(FileNotFoundError, match="OpenSCAD binary not found"):
                 c.discover_binary()
@@ -143,7 +155,7 @@ class TestLibraryTools:
         tools = {t.name: t for t in mcp._tool_manager.list_tools()}
         list_fn = mcp._tool_manager._tools["openscad_list_files"].fn
 
-        result = json.loads(await list_fn(ctx))
+        result = (await list_fn(ctx))
         assert result["files"] == []
         assert result["count"] == 0
 
@@ -161,7 +173,7 @@ class TestLibraryTools:
         ctx = _make_ctx(client)
 
         list_fn = mcp._tool_manager._tools["openscad_list_files"].fn
-        result = json.loads(await list_fn(ctx))
+        result = (await list_fn(ctx))
         assert "test_model.scad" in result["files"]
         assert result["count"] >= 1
 
@@ -196,7 +208,7 @@ class TestLibraryTools:
         client.version = AsyncMock(return_value="OpenSCAD version 2021.01")
 
         ver_fn = mcp._tool_manager._tools["openscad_version"].fn
-        result = json.loads(await ver_fn(ctx))
+        result = (await ver_fn(ctx))
         assert "version" in result
         assert "2021.01" in result["version"]
 
@@ -215,7 +227,7 @@ class TestLibraryTools:
         client.check_syntax = AsyncMock(return_value=(0, "", ""))
 
         syn_fn = mcp._tool_manager._tools["openscad_check_syntax"].fn
-        result = json.loads(await syn_fn(ctx, filename="ok.scad"))
+        result = (await syn_fn(ctx, filename="ok.scad"))
         assert result["passed"] is True
         assert result["errors"] == []
 
@@ -235,7 +247,7 @@ class TestLibraryTools:
         )
 
         syn_fn = mcp._tool_manager._tools["openscad_check_syntax"].fn
-        result = json.loads(await syn_fn(ctx, filename="bad.scad"))
+        result = (await syn_fn(ctx, filename="bad.scad"))
         assert result["passed"] is False
         assert len(result["errors"]) >= 1
 
@@ -250,7 +262,7 @@ class TestLibraryTools:
         ctx = _make_ctx(client)
 
         ex_fn = mcp._tool_manager._tools["openscad_list_examples"].fn
-        result = json.loads(await ex_fn(ctx))
+        result = (await ex_fn(ctx))
         # examples directory should exist and contain our 3 files
         assert "examples" in result
         example_names = result["examples"]

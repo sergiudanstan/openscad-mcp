@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openscad-mcp"
-version = "0.2.0"
-description = "MCP server for OpenSCAD 3D modelling via CLI"
+version = "0.3.0"
+description = "MCP server for OpenSCAD: model, preview (inline images), measure, analyse and export via the CLI"
 requires-python = ">=3.10"
 dependencies = [
     "mcp>=2.3.0,<3",
@@ -14,5 +14,16 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "pytest-asyncio>=1.5.0"]
 
+[project.scripts]
+openscad-mcp = "openscad_mcp.__main__:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+openscad_mcp = ["examples/*.scad"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = ["openscad: needs a real OpenSCAD binary"]

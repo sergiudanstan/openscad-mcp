@@ -26,7 +26,7 @@ jobs:
       - name: Install OpenSCAD (the tools shell out to the CLI)
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends openscad
+          sudo apt-get install -y --no-install-recommends openscad xvfb xauth
           openscad --version
       - name: Install from uv.lock
         env:
@@ -37,7 +37,8 @@ jobs:
         env:
           REQUIRE_OPENSCAD: "1"
           UV_PYTHON: ${{ matrix.python }}
-        run: uv run --locked --extra dev pytest -q tests
+        # PNG previews need an X display even on the CLI; xvfb-run provides one.
+        run: xvfb-run -a uv run --locked --extra dev pytest -q tests
 
   lint:
     name: ruff

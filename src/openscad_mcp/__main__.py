@@ -39,4 +39,5 @@ def main() -> None:
         mcp.run(transport="stdio")
 
 
-main()
+if __name__ == "__main__":
+    main()
